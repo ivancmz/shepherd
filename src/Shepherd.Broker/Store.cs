@@ -17,6 +17,7 @@ internal sealed record AgentRow
     public string? ThreadId { get; init; }
     public bool Automatic { get; init; }
     public bool Channel { get; init; }
+    public string? Distro { get; init; }
     public DateTimeOffset LastSeen { get; init; }
 }
 
@@ -76,6 +77,8 @@ internal sealed class Store : IDisposable
             CREATE INDEX IF NOT EXISTS ix_messages_from ON messages(from_addr, kind);
             """);
         Exec($"INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '{SchemaVersion}');");
+        // H3: WSL distro of an agent (wake-ups via wsl.exe, path translation).
+        if (!HasColumn("agents", "distro")) Exec("ALTER TABLE agents ADD COLUMN distro TEXT;");
     }
 
     // ---------------------------------------------------------------- agents
@@ -86,10 +89,10 @@ internal sealed class Store : IDisposable
         {
             using var cmd = NewCommand();
             cmd.CommandText = """
-                INSERT INTO agents(address, name, node, kind, session_key, cwd, herdr_pane_id, thread_id, automatic, channel, created_at, last_seen)
-                VALUES($address, $name, $node, $kind, $sk, $cwd, $pane, $thread, $auto, $channel, $now, $now)
+                INSERT INTO agents(address, name, node, kind, session_key, cwd, herdr_pane_id, thread_id, automatic, channel, distro, created_at, last_seen)
+                VALUES($address, $name, $node, $kind, $sk, $cwd, $pane, $thread, $auto, $channel, $distro, $now, $now)
                 ON CONFLICT(address) DO UPDATE SET
-                    kind=excluded.kind, session_key=excluded.session_key, cwd=excluded.cwd,
+                    kind=excluded.kind, session_key=excluded.session_key, cwd=excluded.cwd, distro=excluded.distro,
                     herdr_pane_id=excluded.herdr_pane_id, thread_id=COALESCE(excluded.thread_id, agents.thread_id),
                     automatic=excluded.automatic, channel=excluded.channel, last_seen=excluded.last_seen;
                 """;
@@ -103,6 +106,7 @@ internal sealed class Store : IDisposable
             cmd.Parameters.AddWithValue("$thread", (object?)a.ThreadId ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$auto", a.Automatic ? 1 : 0);
             cmd.Parameters.AddWithValue("$channel", a.Channel ? 1 : 0);
+            cmd.Parameters.AddWithValue("$distro", (object?)a.Distro ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$now", Now());
             cmd.ExecuteNonQuery();
         }
@@ -158,6 +162,7 @@ internal sealed class Store : IDisposable
         ThreadId = Str(r, "thread_id"),
         Automatic = r.GetInt32(r.GetOrdinal("automatic")) != 0,
         Channel = r.GetInt32(r.GetOrdinal("channel")) != 0,
+        Distro = Str(r, "distro"),
         LastSeen = ParseTime(r.GetString(r.GetOrdinal("last_seen"))),
     };
 
@@ -365,6 +370,17 @@ internal sealed class Store : IDisposable
 
     private static DateTimeOffset ParseTime(string s) => DateTimeOffset.Parse(s, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
     private static string Now() => DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+
+    private bool HasColumn(string table, string column)
+    {
+        lock (_lock)
+        {
+            using var cmd = NewCommand();
+            cmd.CommandText = $"SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=$c";
+            cmd.Parameters.AddWithValue("$c", column);
+            return Convert.ToInt32(cmd.ExecuteScalar(), CultureInfo.InvariantCulture) > 0;
+        }
+    }
 
     private void Exec(string sql)
     {

@@ -25,11 +25,12 @@ internal sealed class Wakeups
     private readonly string _brokerNode;
     private readonly string? _codex;
     private readonly string? _herdr;
+    private readonly string? _wsl;
     private readonly ConcurrentDictionary<string, WakeState> _states = new();
     private readonly CancellationToken _stopping;
 
     public Wakeups(Store store, ICommandRunner runner, Func<string, bool> isLive, Action<string> log, string brokerNode,
-        string? codexPath, string? herdrPath, CancellationToken stopping)
+        string? codexPath, string? herdrPath, string? wslPath, CancellationToken stopping)
     {
         _store = store;
         _runner = runner;
@@ -38,6 +39,7 @@ internal sealed class Wakeups
         _brokerNode = brokerNode;
         _codex = codexPath;
         _herdr = herdrPath;
+        _wsl = wslPath;
         _stopping = stopping;
     }
 
@@ -146,6 +148,13 @@ internal sealed class Wakeups
             && a.Node == _brokerNode && _isLive(a.Address))
             return (_herdr, ["agent", "prompt", pane]);
 
-        return null; // WSL nodes arrive in H3
+        // Codex inside WSL: its own codex/daemon live in Linux (ADR-0001). `bash -ic` loads the
+        // user's shell setup (fnm/nvm) so `codex` resolves to the Linux build, not the Windows one
+        // that WSL's PATH also exposes; "$@" passes the arguments through untouched.
+        if (a.Kind == AgentKinds.Codex && a.ThreadId is { } wthread && _wsl is not null && a.Distro is { } distro
+            && PathMap.IsWslNode(a.Node))
+            return (_wsl, ["-d", distro, "-e", "bash", "-ic", "codex queue \"$@\"", "bash", "--thread", wthread, "--message"]);
+
+        return null;
     }
 }

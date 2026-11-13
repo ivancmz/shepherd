@@ -13,7 +13,7 @@ namespace Shepherd.Mcp;
 /// </summary>
 internal sealed class BrokerLink : IAsyncDisposable
 {
-    private readonly string _pipeName;
+    private readonly Func<CancellationToken, Task<BrokerClient>> _connect;
     private readonly Action<string> _log;
     private readonly CancellationTokenSource _cts = new();
     private TaskCompletionSource<BrokerClient> _ready = NewReady();
@@ -22,9 +22,9 @@ internal sealed class BrokerLink : IAsyncDisposable
     private string? _requestedName;
     private string? _threadId;
 
-    public BrokerLink(string pipeName, Action<string> log)
+    public BrokerLink(Func<CancellationToken, Task<BrokerClient>> connect, Action<string> log)
     {
-        _pipeName = pipeName;
+        _connect = connect;
         _log = log;
     }
 
@@ -84,7 +84,7 @@ internal sealed class BrokerLink : IAsyncDisposable
             BrokerClient? client = null;
             try
             {
-                client = await BrokerClient.ConnectOrSpawnAsync(_pipeName, "mcp", _cts.Token).ConfigureAwait(false);
+                client = await _connect(_cts.Token).ConfigureAwait(false);
                 client.Peer.Log = _log;
                 client.Peer.OnNotification = OnNotificationAsync;
                 var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -148,6 +148,7 @@ internal sealed class BrokerLink : IAsyncDisposable
         HerdrPaneId = _identity.HerdrPaneId,
         Channel = _identity.Channel,
         Pid = _identity.AgentPid,
+        Distro = _identity.Distro,
     };
 
     private async Task OnNotificationAsync(string method, JsonNode? p)

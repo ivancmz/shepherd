@@ -52,6 +52,8 @@ public sealed class BrokerClient : IAsyncDisposable
         var client = await TryConnectPipeAsync(pipeName, clientKind, TimeSpan.FromMilliseconds(300), ct).ConfigureAwait(false);
         if (client is not null) return client;
 
+        if (Endpoints.IsWsl)
+            throw new RpcException(RpcErrors.BrokerUnavailable, "no broker inside WSL: WSL agents use the Windows broker over TCP");
         BrokerLauncher.Spawn(pipeName);
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
         while (DateTime.UtcNow < deadline)
@@ -63,9 +65,70 @@ public sealed class BrokerClient : IAsyncDisposable
         throw new RpcException(RpcErrors.BrokerUnavailable, "the broker did not start (see shepherd broker run)");
     }
 
-    private async Task HelloAsync(string clientKind, string? token, CancellationToken ct)
+    /// <summary>Connects over TCP and presents the node token (WSL → Windows, ADR-0001).</summary>
+    public static async Task<BrokerClient?> TryConnectTcpAsync(string host, int port, string token, string clientKind, TimeSpan timeout,
+        CancellationToken ct = default, string? node = null)
     {
-        var p = new HelloParams(Endpoints.ProtocolVersion, Names.LocalNode(), clientKind, token);
+        var tcp = new System.Net.Sockets.TcpClient { NoDelay = true };
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(timeout);
+            await tcp.ConnectAsync(host, port, cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is System.Net.Sockets.SocketException or OperationCanceledException && !ct.IsCancellationRequested)
+        {
+            tcp.Dispose();
+            return null;
+        }
+        var stream = tcp.GetStream();
+        var client = new BrokerClient(new RpcPeer(new LineChannel(stream, stream), $"client:{clientKind}"));
+        try
+        {
+            await client.HelloAsync(clientKind, token, ct, node).ConfigureAwait(false);
+        }
+        catch
+        {
+            await client.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+        return client;
+    }
+
+    /// <summary>
+    /// The right connection for this process: inside WSL, TCP to the Windows broker using the
+    /// endpoint and token it published (never spawns); on Windows, the user pipe (spawning the
+    /// broker if needed).
+    /// </summary>
+    public static async Task<BrokerClient> ConnectAsync(string clientKind, CancellationToken ct = default)
+    {
+        if (!Endpoints.IsWsl)
+            return await ConnectOrSpawnAsync(Endpoints.PipeName(), clientKind, ct).ConfigureAwait(false);
+
+        var dir = Endpoints.WindowsDataDirFromWsl()
+            ?? throw new RpcException(RpcErrors.BrokerUnavailable,
+                "no Windows shepherd broker found from WSL: start one on Windows (any `shepherd` command there), or set SHEPHERD_WIN_HOME");
+        BrokerEndpoint ep;
+        string token;
+        try
+        {
+            ep = System.Text.Json.JsonSerializer.Deserialize(await File.ReadAllTextAsync(Path.Combine(dir, Endpoints.EndpointFileName), ct).ConfigureAwait(false),
+                ProtocolJson.Default.BrokerEndpoint) ?? throw new IOException("empty endpoint file");
+            token = (await File.ReadAllTextAsync(Path.Combine(dir, Endpoints.TokenFileName), ct).ConfigureAwait(false)).Trim();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
+        {
+            throw new RpcException(RpcErrors.BrokerUnavailable, $"cannot read the Windows broker endpoint in {dir}: {ex.Message}");
+        }
+        var host = Environment.GetEnvironmentVariable("SHEPHERD_BROKER_HOST") is { Length: > 0 } h ? h : ep.Address;
+        return await TryConnectTcpAsync(host, ep.Port, token, clientKind, TimeSpan.FromSeconds(3), ct).ConfigureAwait(false)
+            ?? throw new RpcException(RpcErrors.BrokerUnavailable,
+                $"cannot reach the Windows broker at {host}:{ep.Port} (is it running? is the firewall rule installed? see `shepherd firewall` on Windows)");
+    }
+
+    private async Task HelloAsync(string clientKind, string? token, CancellationToken ct, string? node = null)
+    {
+        var p = new HelloParams(Endpoints.ProtocolVersion, node ?? Names.LocalNode(), clientKind, token);
         var r = await _peer.RequestAsync(Methods.Hello, Json.ToNode(p, ProtocolJson.Default.HelloParams), ct, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         Hello = Json.Result(r, ProtocolJson.Default.HelloResult);
     }

@@ -28,7 +28,7 @@ public class McpServerTests
         public static async Task<Shim> StartAsync(TestBroker broker, Dictionary<string, string?> env, string clientName = "claude-code")
         {
             var pair = await DuplexPair.CreateAsync();
-            var server = new McpServer(pair.Server, pair.Server, broker.PipeName, _ => { }, k => env.GetValueOrDefault(k));
+            var server = new McpServer(pair.Server, pair.Server, broker.Connect, _ => { }, k => env.GetValueOrDefault(k));
             var client = new RpcPeer(new LineChannel(pair.Client, pair.Client), "test-client");
             var shim = new Shim(pair, server, client);
             await client.RequestAsync("initialize", new JsonObject
@@ -63,7 +63,7 @@ public class McpServerTests
     {
         await using var b = await TestBroker.StartAsync();
         var pair = await DuplexPair.CreateAsync();
-        await using var server = new McpServer(pair.Server, pair.Server, b.PipeName, _ => { }, _ => null);
+        await using var server = new McpServer(pair.Server, pair.Server, b.Connect, _ => { }, _ => null);
         _ = Task.Run(server.RunAsync);
         await using var client = new RpcPeer(new LineChannel(pair.Client, pair.Client), "c");
         _ = Task.Run(client.RunAsync);
@@ -192,7 +192,7 @@ public class McpServerTests
         })
         {
             var pair = await DuplexPair.CreateAsync();
-            await using var server = new McpServer(pair.Server, pair.Server, b.PipeName, _ => { }, k => env.GetValueOrDefault(k));
+            await using var server = new McpServer(pair.Server, pair.Server, b.Connect, _ => { }, k => env.GetValueOrDefault(k));
             _ = Task.Run(server.RunAsync);
             await using var c = new RpcPeer(new LineChannel(pair.Client, pair.Client), "c");
             _ = Task.Run(c.RunAsync);

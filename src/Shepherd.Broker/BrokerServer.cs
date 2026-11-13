@@ -1,5 +1,9 @@
 using System.Collections.Concurrent;
 using System.IO.Pipes;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 using Shepherd.Protocol;
@@ -23,6 +27,14 @@ public sealed record BrokerOptions
     public string? CodexPath { get; init; }
     /// <summary>Path of the herdr binary; defaults to <see cref="ToolPaths.Herdr"/>. Empty disables herdr wake-ups.</summary>
     public string? HerdrPath { get; init; }
+    /// <summary>Path of wsl.exe for WSL wake-ups; defaults to System32. Empty disables them.</summary>
+    public string? WslPath { get; init; }
+
+    /// <summary>
+    /// TCP listener for WSL nodes (ADR-0001): <c>auto</c> (the "vEthernet (WSL)" interface only),
+    /// <c>off</c>, or <c>address:port</c>. Defaults to <c>SHEPHERD_TCP</c>, else <c>auto</c>.
+    /// </summary>
+    public string? TcpBind { get; init; }
 }
 
 /// <summary>
@@ -45,6 +57,13 @@ public sealed class BrokerServer : IAsyncDisposable
     private readonly Lock _registryLock = new();
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
     private readonly Wakeups _wakeups;
+    private readonly string _token;
+    private TcpListener? _tcp;
+
+    /// <summary>The bound TCP endpoint for WSL nodes, if any.</summary>
+    public IPEndPoint? TcpEndpoint { get; private set; }
+    /// <summary>Shared secret WSL shims present in <c>hello</c> (file <c>node-token</c> in the data dir).</summary>
+    internal string Token => _token;
 
     public BrokerServer(BrokerOptions options)
     {
@@ -57,8 +76,29 @@ public sealed class BrokerServer : IAsyncDisposable
         var codex = options.CodexPath ?? ToolPaths.Codex();
         var herdr = options.HerdrPath ?? ToolPaths.Herdr();
         Log($"wake-ups: codex={(string.IsNullOrEmpty(codex) ? "unavailable" : codex)}, herdr={(string.IsNullOrEmpty(herdr) ? "unavailable" : herdr)}");
+        var wsl = options.WslPath ?? (OperatingSystem.IsWindows() ? Path.Combine(Environment.SystemDirectory, "wsl.exe") : "");
         _wakeups = new Wakeups(_store, options.Runner ?? new ProcessRunner(), a => _live.ContainsKey(a), Log, options.Node,
-            string.IsNullOrEmpty(codex) ? null : codex, string.IsNullOrEmpty(herdr) ? null : herdr, _stop.Token);
+            string.IsNullOrEmpty(codex) ? null : codex, string.IsNullOrEmpty(herdr) ? null : herdr,
+            string.IsNullOrEmpty(wsl) ? null : wsl, _stop.Token);
+        _token = LoadOrCreateToken(options.DataDir);
+    }
+
+    /// <summary>
+    /// The node token lives in the user's data dir, whose ACL is inherited from the user profile
+    /// (%LOCALAPPDATA%: the user, SYSTEM and Administrators). WSL reads it through /mnt/c as the
+    /// same user: the same trust boundary (ADR-0001).
+    /// </summary>
+    private static string LoadOrCreateToken(string dataDir)
+    {
+        var path = Path.Combine(dataDir, Endpoints.TokenFileName);
+        if (File.Exists(path))
+        {
+            var existing = File.ReadAllText(path).Trim();
+            if (existing.Length >= 32) return existing;
+        }
+        var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        File.WriteAllText(path, token);
+        return token;
     }
 
     public CancellationToken Stopping => _stop.Token;
@@ -89,6 +129,7 @@ public sealed class BrokerServer : IAsyncDisposable
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _stop.Token);
         var token = linked.Token;
         Log($"broker {_opt.Version} listening on pipe '{_opt.PipeName}' as node '{_opt.Node}'");
+        StartTcp(token);
         while (!token.IsCancellationRequested)
         {
             // CurrentUserOnly: the pipe's ACL admits only this user (ADR-0004).
@@ -112,7 +153,81 @@ public sealed class BrokerServer : IAsyncDisposable
             }
             Accept(server, "pipe", requiresToken: false);
         }
+        _tcp?.Stop();
         foreach (var c in _connections.Keys) c.Peer.Close();
+    }
+
+    // ------------------------------------------------------------------ TCP (WSL nodes)
+
+    private void StartTcp(CancellationToken ct)
+    {
+        var bind = _opt.TcpBind ?? Environment.GetEnvironmentVariable("SHEPHERD_TCP") ?? "auto";
+        if (bind.Equals("off", StringComparison.OrdinalIgnoreCase)) return;
+
+        IPEndPoint? ep;
+        if (bind.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        {
+            var ip = WslInterfaceAddress();
+            if (ip is null)
+            {
+                Log("TCP for WSL disabled: no 'vEthernet (WSL)' interface (WSL not running, or networkingMode=mirrored: set SHEPHERD_TCP=127.0.0.1:47321)");
+                return;
+            }
+            ep = new IPEndPoint(ip, Endpoints.DefaultTcpPort);
+        }
+        else if (!IPEndPoint.TryParse(bind, out ep))
+        {
+            Log($"invalid SHEPHERD_TCP '{bind}'; TCP disabled");
+            return;
+        }
+
+        try
+        {
+            _tcp = new TcpListener(ep);
+            _tcp.Start();
+        }
+        catch (SocketException ex)
+        {
+            Log($"cannot listen on {ep}: {ex.Message}");
+            _tcp = null;
+            return;
+        }
+        TcpEndpoint = (IPEndPoint)_tcp.LocalEndpoint;
+        var file = Path.Combine(_opt.DataDir, Endpoints.EndpointFileName);
+        File.WriteAllText(file, System.Text.Json.JsonSerializer.Serialize(
+            new BrokerEndpoint(TcpEndpoint.Address.ToString(), TcpEndpoint.Port), ProtocolJson.Default.BrokerEndpoint));
+        Log($"listening for WSL nodes on tcp {TcpEndpoint} (token required)");
+
+        var listener = _tcp;
+        _ = Task.Run(async () =>
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                TcpClient client;
+                try
+                {
+                    client = await listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or SocketException)
+                {
+                    return;
+                }
+                client.NoDelay = true;
+                Accept(client.GetStream(), "tcp", requiresToken: true);
+            }
+        }, ct);
+    }
+
+    /// <summary>IPv4 of the Hyper-V switch WSL uses in NAT mode (the WSL default gateway).</summary>
+    private static IPAddress? WslInterfaceAddress()
+    {
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (nic.OperationalStatus != OperationalStatus.Up || !nic.Name.Contains("WSL", StringComparison.OrdinalIgnoreCase)) continue;
+            var v4 = nic.GetIPProperties().UnicastAddresses.FirstOrDefault(a => a.Address.AddressFamily == AddressFamily.InterNetwork);
+            if (v4 is not null) return v4.Address;
+        }
+        return null;
     }
 
     private void Accept(Stream stream, string transport, bool requiresToken)
@@ -179,8 +294,12 @@ public sealed class BrokerServer : IAsyncDisposable
         if (h.Protocol != Endpoints.ProtocolVersion)
             throw new RpcException(RpcErrors.ProtocolMismatch, $"protocol {h.Protocol} not supported",
                 new JsonObject { ["supported"] = new JsonArray(Endpoints.ProtocolVersion) });
-        if (conn.RequiresToken)
-            throw new RpcException(RpcErrors.Unauthorized, "token required"); // TCP transport arrives in H3
+        if (conn.RequiresToken && !TokenMatches(h.Token))
+        {
+            Log("tcp hello rejected: bad or missing token");
+            _ = Task.Run(async () => { await Task.Delay(100).ConfigureAwait(false); conn.Peer.Close(); });
+            throw new RpcException(RpcErrors.Unauthorized, "invalid node token");
+        }
         if (!Names.IsValid(h.Node))
             throw new RpcException(RpcErrors.InvalidName, $"invalid node name '{h.Node}'");
         conn.HelloDone = true;
@@ -188,6 +307,10 @@ public sealed class BrokerServer : IAsyncDisposable
         conn.ClientKind = h.Client;
         return Json.ToNode(new HelloResult(Endpoints.ProtocolVersion, _opt.Node, _opt.Version), ProtocolJson.Default.HelloResult);
     }
+
+    private bool TokenMatches(string? presented) =>
+        presented is not null &&
+        CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(presented), Encoding.UTF8.GetBytes(_token));
 
     private JsonNode Register(Connection conn, RegisterParams p)
     {
@@ -241,7 +364,7 @@ public sealed class BrokerServer : IAsyncDisposable
             _store.UpsertAgent(new AgentRow
             {
                 Address = address, Name = name, Node = node, Kind = p.Kind, SessionKey = p.SessionKey,
-                Cwd = p.Cwd, HerdrPaneId = p.HerdrPaneId,
+                Cwd = p.Cwd, HerdrPaneId = p.HerdrPaneId, Distro = p.Distro,
                 ThreadId = existing?.SessionKey == p.SessionKey ? existing?.ThreadId : null,
                 Automatic = automatic, Channel = p.Channel,
             });
@@ -302,7 +425,7 @@ public sealed class BrokerServer : IAsyncDisposable
         var msg = new MessageRow
         {
             Id = id, ThreadId = id, From = from, FromHuman = conn.Kind == AgentKinds.Human,
-            Kind = p.Kind, Subject = p.Subject, Body = p.Body, Refs = p.Refs, CreatedAt = DateTimeOffset.UtcNow,
+            Kind = p.Kind, Subject = p.Subject, Body = p.Body, Refs = StampRefs(p.Refs, conn.Node!), CreatedAt = DateTimeOffset.UtcNow,
         };
         _store.InsertMessage(msg, recipients);
         Audit("send", msg, recipients);
@@ -327,7 +450,7 @@ public sealed class BrokerServer : IAsyncDisposable
             Id = id, ThreadId = original.ThreadId, InReplyTo = original.Id, From = from,
             FromHuman = conn.Kind == AgentKinds.Human, Kind = MessageKinds.Reply,
             Subject = original.Subject is null ? null : (original.Subject.StartsWith("Re: ", StringComparison.Ordinal) ? original.Subject : "Re: " + original.Subject),
-            Body = p.Body, Refs = p.Refs, CreatedAt = DateTimeOffset.UtcNow,
+            Body = p.Body, Refs = StampRefs(p.Refs, conn.Node!), CreatedAt = DateTimeOffset.UtcNow,
         };
         var recipients = new List<string> { original.From };
         _store.InsertMessage(msg, recipients);
@@ -341,7 +464,7 @@ public sealed class BrokerServer : IAsyncDisposable
     {
         var me = RequireRegistered(conn);
         var limit = Math.Clamp(p.Limit, 1, 100);
-        var messages = _store.Inbox(me, p.UnreadOnly, limit);
+        var messages = _store.Inbox(me, p.UnreadOnly, limit).Select(m => Localize(m, me)).ToList();
         foreach (var m in messages)
             if (m.State is RecipientStates.Queued or RecipientStates.Notified)
                 _store.Advance(m.Id, me, RecipientStates.Read);
@@ -398,7 +521,7 @@ public sealed class BrokerServer : IAsyncDisposable
                 try
                 {
                     await target.Peer.NotifyAsync(Methods.MessageNew,
-                        Json.ToNode(msg.ToInbox(RecipientStates.Queued), ProtocolJson.Default.InboxMessage)).ConfigureAwait(false);
+                        Json.ToNode(Localize(msg.ToInbox(RecipientStates.Queued), r), ProtocolJson.Default.InboxMessage)).ConfigureAwait(false);
                     if (hasChannel) _store.Advance(msg.Id, r, RecipientStates.Notified);
                 }
                 catch (Exception ex)
@@ -420,7 +543,7 @@ public sealed class BrokerServer : IAsyncDisposable
             {
                 foreach (var m in _store.Inbox(address, unreadOnly: true, limit: 50))
                 {
-                    await target.Peer.NotifyAsync(Methods.MessageNew, Json.ToNode(m, ProtocolJson.Default.InboxMessage)).ConfigureAwait(false);
+                    await target.Peer.NotifyAsync(Methods.MessageNew, Json.ToNode(Localize(m, address), ProtocolJson.Default.InboxMessage)).ConfigureAwait(false);
                     _store.Advance(m.Id, address, RecipientStates.Notified);
                 }
             }
@@ -436,6 +559,24 @@ public sealed class BrokerServer : IAsyncDisposable
     }
 
     // ------------------------------------------------------------------ helpers
+
+    private static List<FileRef>? StampRefs(List<FileRef>? refs, string node) =>
+        refs?.Select(r => r with { Node = r.Node ?? node }).ToList();
+
+    /// <summary>Rewrites file references into the recipient's path flavour (ADR-0006).</summary>
+    private InboxMessage Localize(InboxMessage m, string recipient)
+    {
+        if (m.Refs is not { Count: > 0 }) return m;
+        var to = _store.GetAgent(recipient);
+        if (to is null) return m;
+        var fromDistro = _store.GetAgent(m.From)?.Distro;
+        var refs = m.Refs.Select(r => r with
+        {
+            Path = PathMap.Translate(r.Path, r.Node ?? to.Node, fromDistro, to.Node, to.Distro),
+            Node = to.Node,
+        }).ToList();
+        return m with { Refs = refs };
+    }
 
     private bool IsHeldByOther(string address, string? sessionKey) =>
         _live.TryGetValue(address, out var c) && !c.Peer.IsClosed && (sessionKey is null || _store.GetAgent(address)?.SessionKey != sessionKey);

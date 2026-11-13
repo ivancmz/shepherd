@@ -19,18 +19,33 @@ internal sealed class TestBroker : IAsyncDisposable
     private BrokerServer _server;
     private Task _run;
 
-    private TestBroker(string dataDir)
+    private readonly bool _tcp;
+
+    private TestBroker(string dataDir, bool tcp)
     {
         DataDir = dataDir;
+        _tcp = tcp;
         (_server, _run) = Start();
     }
 
-    public static async Task<TestBroker> StartAsync()
+    /// <param name="tcp">Also listen on 127.0.0.1 (random port) like the WSL listener.</param>
+    public static async Task<TestBroker> StartAsync(bool tcp = false)
     {
         var dir = Path.Combine(Path.GetTempPath(), "shepherd-tests", Guid.NewGuid().ToString("N")[..12]);
-        var b = new TestBroker(dir);
+        var b = new TestBroker(dir, tcp);
         await b.WaitListeningAsync();
         return b;
+    }
+
+    public System.Net.IPEndPoint? TcpEndpoint => _server.TcpEndpoint;
+    public string Token => _server.Token;
+
+    /// <summary>Connects over TCP announcing <paramref name="node"/> (simulates a WSL shim).</summary>
+    public async Task<BrokerClient> ConnectTcpAsync(string node, string? token = null)
+    {
+        var ep = TcpEndpoint ?? throw new InvalidOperationException("TCP not enabled");
+        return await BrokerClient.TryConnectTcpAsync(ep.Address.ToString(), ep.Port, token ?? Token, "mcp", TimeSpan.FromSeconds(5), default, node)
+            ?? throw new InvalidOperationException("tcp connect failed");
     }
 
     private (BrokerServer, Task) Start()
@@ -45,6 +60,8 @@ internal sealed class TestBroker : IAsyncDisposable
             Runner = Runner,
             CodexPath = "codex-test",
             HerdrPath = "herdr-test",
+            WslPath = "wsl-test",
+            TcpBind = _tcp ? "127.0.0.1:0" : "off",
         });
         return (server, Task.Run(() => server.RunAsync()));
     }
@@ -57,6 +74,9 @@ internal sealed class TestBroker : IAsyncDisposable
         (_server, _run) = Start();
         await WaitListeningAsync();
     }
+
+    /// <summary>Connector for an in-process MCP shim.</summary>
+    public Task<BrokerClient> Connect(CancellationToken ct) => BrokerClient.ConnectOrSpawnAsync(PipeName, "mcp", ct);
 
     public async Task<BrokerClient> ConnectAsync(string clientKind = "mcp")
     {
@@ -92,6 +112,8 @@ internal sealed class TestBroker : IAsyncDisposable
         await _server.DisposeAsync();
         await _run;
         try { Directory.Delete(DataDir, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        // On Linux, .NET named pipes are Unix sockets that outlive the server.
+        if (OperatingSystem.IsLinux()) File.Delete(Path.Combine(Path.GetTempPath(), "CoreFxPipe_" + PipeName));
     }
 }
 
@@ -117,13 +139,16 @@ internal sealed class DuplexPair : IAsyncDisposable
         var server = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
         var client = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.Asynchronous);
         await Task.WhenAll(server.WaitForConnectionAsync(), client.ConnectAsync());
-        return new DuplexPair { Server = server, Client = client };
+        return new DuplexPair { Server = server, Client = client, Name = name };
     }
+
+    public required string Name { get; init; }
 
     public async ValueTask DisposeAsync()
     {
         await Client.DisposeAsync();
         await Server.DisposeAsync();
+        if (OperatingSystem.IsLinux()) File.Delete(Path.Combine(Path.GetTempPath(), "CoreFxPipe_" + Name));
     }
 }
 

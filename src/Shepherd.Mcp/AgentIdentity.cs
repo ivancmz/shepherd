@@ -15,6 +15,7 @@ internal sealed record AgentIdentity
     public string? HerdrPaneId { get; init; }
     public int? AgentPid { get; init; }
     public bool Channel { get; init; }
+    public string? Distro { get; init; }
 
     /// <param name="clientName">MCP <c>clientInfo.name</c> from <c>initialize</c> (e.g. <c>claude-code</c>, <c>codex-mcp-client</c>).</param>
     public static AgentIdentity Detect(string? clientName, Func<string, string?>? env = null)
@@ -55,6 +56,7 @@ internal sealed record AgentIdentity
             HerdrPaneId = env("HERDR_PANE_ID") is { Length: > 0 } pane ? pane : null,
             AgentPid = parent?.Pid,
             Channel = env("SHEPHERD_CHANNEL") == "1",
+            Distro = env("WSL_DISTRO_NAME") is { Length: > 0 } d ? d : Wsl.Distro,
         };
     }
 }

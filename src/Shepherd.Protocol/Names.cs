@@ -34,8 +34,7 @@ public static partial class Names
     {
         var overrideNode = Environment.GetEnvironmentVariable("SHEPHERD_NODE");
         if (IsValid(overrideNode)) return overrideNode!;
-        var distro = Environment.GetEnvironmentVariable("WSL_DISTRO_NAME");
-        if (!string.IsNullOrEmpty(distro)) return Truncate("wsl-" + Sanitize(distro, "linux"));
+        if (Wsl.IsWsl) return Truncate("wsl-" + Sanitize(Wsl.Distro, "linux"));
         var prefix = OperatingSystem.IsWindows() ? "pc-" : "host-";
         return Truncate(prefix + Sanitize(Environment.MachineName, "local"));
     }

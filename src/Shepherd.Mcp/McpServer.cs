@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
 using Shepherd.Protocol;
+using Shepherd.Protocol.Client;
 using Shepherd.Protocol.Wire;
 
 namespace Shepherd.Mcp;
@@ -37,12 +38,13 @@ public sealed class McpServer : IAsyncDisposable
     private bool _channel;
     private volatile bool _initialized;
 
-    public McpServer(Stream input, Stream output, string pipeName, Action<string> log, Func<string, string?>? env = null)
+    /// <param name="connect">How to reach the broker: <see cref="BrokerClient.ConnectAsync"/> in production.</param>
+    public McpServer(Stream input, Stream output, Func<CancellationToken, Task<BrokerClient>> connect, Action<string> log, Func<string, string?>? env = null)
     {
         _log = log;
         _env = env ?? Environment.GetEnvironmentVariable;
         _peer = new RpcPeer(new LineChannel(input, output), "mcp") { Log = log, OnRequest = HandleAsync, OnNotification = OnClientNotificationAsync };
-        _link = new BrokerLink(pipeName, log) { OnMessage = OnMessageAsync };
+        _link = new BrokerLink(connect, log) { OnMessage = OnMessageAsync };
     }
 
     /// <summary>Serves until stdin closes.</summary>

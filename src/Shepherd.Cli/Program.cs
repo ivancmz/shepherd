@@ -21,10 +21,31 @@ internal static class Program
           shepherd status                       Broker status
           shepherd broker run                   Run the broker in the foreground
           shepherd broker stop                  Stop the running broker
+          shepherd firewall                     Show the Windows Firewall rule WSL agents need (does not apply it)
           shepherd version
 
-        Environment: SHEPHERD_HOME (data dir), SHEPHERD_PIPE (pipe name), SHEPHERD_USER (your name).
+        Environment: SHEPHERD_HOME (data dir), SHEPHERD_PIPE (pipe name), SHEPHERD_USER (your name),
+        SHEPHERD_TCP (WSL listener: auto | off | addr:port), SHEPHERD_WIN_HOME (from WSL: Windows data dir).
         """;
+
+    private static int Firewall()
+    {
+        if (!OperatingSystem.IsWindows()) return Fail("run this on Windows");
+        var exe = Environment.ProcessPath ?? "shepherd.exe";
+        return Print($"""
+            WSL agents reach the Windows broker over TCP on the WSL virtual interface (ADR-0001).
+            If they cannot connect, allow it with this rule, from an elevated PowerShell:
+
+              New-NetFirewallRule -DisplayName "shepherd broker (WSL)" -Direction Inbound -Action Allow `
+                -Protocol TCP -LocalPort {Endpoints.DefaultTcpPort} -InterfaceAlias "vEthernet (WSL*)" `
+                -Program "{exe}"
+
+            It only admits TCP {Endpoints.DefaultTcpPort} on the WSL interface and only for this executable;
+            connections still need the node token. Remove it with:
+
+              Remove-NetFirewallRule -DisplayName "shepherd broker (WSL)"
+            """);
+    }
 
     public static async Task<int> Main(string[] args)
     {
@@ -40,6 +61,7 @@ internal static class Program
                 "reply" => await ReplyAsync(args.Skip(1).ToArray()),
                 "agents" => await AgentsAsync(),
                 "status" => await StatusAsync(),
+                "firewall" => Firewall(),
                 "version" or "--version" => Print(typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.0.0"),
                 null or "help" or "--help" or "-h" => Print(Usage),
                 var other => Fail($"unknown command '{other}'\n\n{Usage}"),
@@ -59,7 +81,7 @@ internal static class Program
         var stdin = Console.OpenStandardInput();
         var stdout = Console.OpenStandardOutput();
         void Log(string s) => Console.Error.WriteLine($"[shepherd {DateTime.Now:HH:mm:ss}] {s}");
-        await using var server = new McpServer(stdin, stdout, Endpoints.PipeName(), Log);
+        await using var server = new McpServer(stdin, stdout, ct => BrokerClient.ConnectAsync("mcp", ct), Log);
         await server.RunAsync();
         return 0;
     }
@@ -112,7 +134,7 @@ internal static class Program
 
     private static async Task<BrokerClient> ConnectAsUserAsync()
     {
-        var c = await BrokerClient.ConnectOrSpawnAsync(Endpoints.PipeName(), "cli");
+        var c = await BrokerClient.ConnectAsync("cli");
         await c.RegisterAsync(new RegisterParams { Kind = AgentKinds.Human, Name = Endpoints.HumanName() });
         return c;
     }
@@ -159,7 +181,10 @@ internal static class Program
 
     private static async Task<int> StatusAsync()
     {
-        await using var c = await BrokerClient.TryConnectPipeAsync(Endpoints.PipeName(), "cli", TimeSpan.FromSeconds(1));
+        // Status never starts a broker; inside WSL it asks the Windows one over TCP.
+        await using var c = Endpoints.IsWsl
+            ? await BrokerClient.ConnectAsync("cli")
+            : await BrokerClient.TryConnectPipeAsync(Endpoints.PipeName(), "cli", TimeSpan.FromSeconds(1));
         if (c is null) return Print($"No broker running (pipe '{Endpoints.PipeName()}').");
         var s = await c.StatusAsync();
         return Print($"""

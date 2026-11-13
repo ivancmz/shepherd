@@ -47,6 +47,9 @@ public static class RecipientStates
 
 public sealed record HelloParams(int Protocol, string Node, string Client, string? Token = null);
 
+/// <summary>Where WSL shims reach the Windows broker (ADR-0001); written by the broker next to its data.</summary>
+public sealed record BrokerEndpoint(string Address, int Port);
+
 public sealed record HelloResult(int Protocol, string Node, string BrokerVersion);
 
 public sealed record RegisterParams
@@ -61,6 +64,8 @@ public sealed record RegisterParams
     /// <summary>The client can push messages straight into the agent (Claude channel).</summary>
     public bool Channel { get; init; }
     public int? Pid { get; init; }
+    /// <summary>WSL distro name (exact, e.g. <c>Ubuntu-24.04</c>) for WSL agents: wake-ups and path translation.</summary>
+    public string? Distro { get; init; }
 }
 
 public sealed record RegisterResult(string Name, string Address, bool Automatic, string? Notice = null);
@@ -156,4 +161,5 @@ public sealed record StatusResult
 [JsonSerializable(typeof(ListAgentsResult))]
 [JsonSerializable(typeof(StatusResult))]
 [JsonSerializable(typeof(List<FileRef>))]
+[JsonSerializable(typeof(BrokerEndpoint))]
 public sealed partial class ProtocolJson : JsonSerializerContext;
