@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Shepherd.Broker/Shepherd.Broker.csproj" />
+    <Project Path="src/Shepherd.Cli/Shepherd.Cli.csproj" />
+    <Project Path="src/Shepherd.Mcp/Shepherd.Mcp.csproj" />
+    <Project Path="src/Shepherd.Protocol/Shepherd.Protocol.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Shepherd.Tests/Shepherd.Tests.csproj" />
+  </Folder>
+</Solution>

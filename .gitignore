@@ -1,0 +1,17 @@
+# Private: never commit
+CLAUDE.md
+.claude/
+docs/bus/plan.md
+BRIEF.md
+docs/bus/analisis.md
+docs/evaluacion.md
+docs/mensajeria-existente.md
+
+# .NET build output
+bin/
+obj/
+*.user
+.vs/
+TestResults/
+publish/
+spikes/out/

@@ -1,0 +1,23 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Shepherd.Cli</RootNamespace>
+    <AssemblyName>shepherd</AssemblyName>
+  </PropertyGroup>
+
+  <!-- Publishing (with a RID) builds NativeAOT and pins the patched runtime: 10.0.12 (the
+       current SDK's default) is affected by CVE-2026-111497 (Brotli decoder).
+       Framework-dependent dev builds (no RID) skip the AOT toolchain entirely. -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' != ''">
+    <PublishAot>true</PublishAot>
+    <RuntimeFrameworkVersion>10.0.15</RuntimeFrameworkVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Shepherd.Protocol\Shepherd.Protocol.csproj" />
+    <ProjectReference Include="..\Shepherd.Broker\Shepherd.Broker.csproj" />
+    <ProjectReference Include="..\Shepherd.Mcp\Shepherd.Mcp.csproj" />
+  </ItemGroup>
+
+</Project>
