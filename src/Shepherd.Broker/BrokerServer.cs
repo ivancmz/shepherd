@@ -16,6 +16,13 @@ public sealed record BrokerOptions
     public TimeSpan Retention { get; init; } = TimeSpan.FromDays(90);
     public bool KeepAlive { get; init; } = true;
     public Action<string>? Log { get; init; }
+
+    /// <summary>Runs codex/herdr for wake-ups (ADR-0002). Tests inject a fake.</summary>
+    public ICommandRunner? Runner { get; init; }
+    /// <summary>Path of the codex binary; defaults to <see cref="ToolPaths.Codex"/>. Empty disables Codex wake-ups.</summary>
+    public string? CodexPath { get; init; }
+    /// <summary>Path of the herdr binary; defaults to <see cref="ToolPaths.Herdr"/>. Empty disables herdr wake-ups.</summary>
+    public string? HerdrPath { get; init; }
 }
 
 /// <summary>
@@ -37,6 +44,7 @@ public sealed class BrokerServer : IAsyncDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly Lock _registryLock = new();
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
+    private readonly Wakeups _wakeups;
 
     public BrokerServer(BrokerOptions options)
     {
@@ -46,6 +54,11 @@ public sealed class BrokerServer : IAsyncDisposable
         _audit = new AuditLog(options.DataDir);
         var purged = _store.Purge(options.Retention);
         if (purged > 0) Log($"purged {purged} old messages");
+        var codex = options.CodexPath ?? ToolPaths.Codex();
+        var herdr = options.HerdrPath ?? ToolPaths.Herdr();
+        Log($"wake-ups: codex={(string.IsNullOrEmpty(codex) ? "unavailable" : codex)}, herdr={(string.IsNullOrEmpty(herdr) ? "unavailable" : herdr)}");
+        _wakeups = new Wakeups(_store, options.Runner ?? new ProcessRunner(), a => _live.ContainsKey(a), Log, options.Node,
+            string.IsNullOrEmpty(codex) ? null : codex, string.IsNullOrEmpty(herdr) ? null : herdr, _stop.Token);
     }
 
     public CancellationToken Stopping => _stop.Token;
@@ -128,7 +141,8 @@ public sealed class BrokerServer : IAsyncDisposable
             if (conn.Address is { } a && _live.TryGetValue(a, out var cur) && ReferenceEquals(cur, conn))
             {
                 _live.TryRemove(a, out _);
-                _store.Touch(a);
+                try { _store.Touch(a); }
+                catch (ObjectDisposedException) { /* broker shutting down */ }
                 Log($"{a} disconnected{(error is null ? "" : $" ({error.Message})")}");
             }
         }
@@ -151,6 +165,7 @@ public sealed class BrokerServer : IAsyncDisposable
             Methods.Send => await SendAsync(conn, Json.Params(p, ProtocolJson.Default.SendParams)).ConfigureAwait(false),
             Methods.Reply => await ReplyAsync(conn, Json.Params(p, ProtocolJson.Default.ReplyParams)).ConfigureAwait(false),
             Methods.ReadInbox => ReadInbox(conn, p is null ? new ReadInboxParams() : Json.Params(p, ProtocolJson.Default.ReadInboxParams)),
+            Methods.Ack => Ack(conn, Json.Params(p, ProtocolJson.Default.AckParams)),
             Methods.ListAgents => ListAgents(),
             Methods.Status => Status(),
             Methods.Shutdown => Shutdown(conn),
@@ -237,6 +252,7 @@ public sealed class BrokerServer : IAsyncDisposable
             Log($"{address} registered ({p.Kind}{(p.Channel ? ", channel" : "")}{(automatic ? ", automatic name" : "")})");
             var unread = _store.CountUnread(address);
             var notice = unread > 0 ? $"{unread} unread message(s) waiting" : null;
+            if (unread > 0) _ = Task.Run(() => DeliverPendingAsync(address));
             return Json.ToNode(new RegisterResult(name, address, automatic, notice), ProtocolJson.Default.RegisterResult);
         }
     }
@@ -244,7 +260,17 @@ public sealed class BrokerServer : IAsyncDisposable
     private JsonNode Identify(Connection conn, IdentifyParams p)
     {
         var address = RequireRegistered(conn);
+        var before = _store.GetAgent(address)?.ThreadId;
         _store.Touch(address, p.ThreadId);
+        // First time we learn a Codex thread: anything still queued can now be announced.
+        if (p.ThreadId is not null && before != p.ThreadId) _wakeups.Request(address);
+        return new JsonObject();
+    }
+
+    private JsonNode Ack(Connection conn, AckParams p)
+    {
+        var me = RequireRegistered(conn);
+        foreach (var id in p.MessageIds ?? []) _store.Advance(id, me, RecipientStates.Read);
         return new JsonObject();
     }
 
@@ -331,6 +357,7 @@ public sealed class BrokerServer : IAsyncDisposable
             Name = a.Name, Address = a.Address, Node = a.Node, Kind = a.Kind,
             Online = _live.ContainsKey(a.Address) || (a.Kind == AgentKinds.Human && _connections.Keys.Any(c => c.Address == a.Address)),
             Automatic = a.Automatic, Cwd = a.Cwd, HerdrPaneId = a.HerdrPaneId, Channel = a.Channel,
+            Wakeable = (a.Channel && _live.ContainsKey(a.Address)) || _wakeups.CanWake(a),
             Unread = _store.CountUnread(a.Address), WaitingOn = _store.WaitingOn(a.Address), LastSeen = a.LastSeen,
         }).ToList();
         return Json.ToNode(new ListAgentsResult(agents), ProtocolJson.Default.ListAgentsResult);
@@ -354,25 +381,57 @@ public sealed class BrokerServer : IAsyncDisposable
     // ------------------------------------------------------------------ delivery
 
     /// <summary>
-    /// Pushes <c>message.new</c> to live recipients. A recipient becomes <c>notified</c> only when
-    /// its client can surface the message to the agent (Claude channel). Wake-ups for agents
-    /// without a channel (codex queue, herdr) arrive in H2.
+    /// Delivery (ADR-0002, diagram 1). A live recipient with a Claude channel gets the full message
+    /// pushed (its shim acks → read). Any other live recipient gets <c>message.new</c> so its next
+    /// tool result mentions new mail, and every recipient without a channel is woken if possible
+    /// (codex queue / herdr) with a fixed notice. Messages are already stored: a failed push or
+    /// wake-up never loses them.
     /// </summary>
     private async Task DeliverAsync(MessageRow msg, List<string> recipients)
     {
         foreach (var r in recipients)
         {
-            if (!_live.TryGetValue(r, out var target)) continue;
-            try
+            var hasChannel = false;
+            if (_live.TryGetValue(r, out var target))
             {
-                await target.Peer.NotifyAsync(Methods.MessageNew,
-                    Json.ToNode(msg.ToInbox(RecipientStates.Queued), ProtocolJson.Default.InboxMessage)).ConfigureAwait(false);
-                if (target.Channel) _store.Advance(msg.Id, r, RecipientStates.Notified);
+                hasChannel = target.Channel;
+                try
+                {
+                    await target.Peer.NotifyAsync(Methods.MessageNew,
+                        Json.ToNode(msg.ToInbox(RecipientStates.Queued), ProtocolJson.Default.InboxMessage)).ConfigureAwait(false);
+                    if (hasChannel) _store.Advance(msg.Id, r, RecipientStates.Notified);
+                }
+                catch (Exception ex)
+                {
+                    hasChannel = false;
+                    Log($"push to {r} failed: {ex.Message}");
+                }
             }
-            catch (Exception ex)
+            if (!hasChannel) _wakeups.Request(r);
+        }
+    }
+
+    /// <summary>On (re)registration: push unread mail to a channel, or wake the agent.</summary>
+    private async Task DeliverPendingAsync(string address)
+    {
+        try
+        {
+            if (_live.TryGetValue(address, out var target) && target.Channel)
             {
-                Log($"push to {r} failed: {ex.Message}");
+                foreach (var m in _store.Inbox(address, unreadOnly: true, limit: 50))
+                {
+                    await target.Peer.NotifyAsync(Methods.MessageNew, Json.ToNode(m, ProtocolJson.Default.InboxMessage)).ConfigureAwait(false);
+                    _store.Advance(m.Id, address, RecipientStates.Notified);
+                }
             }
+            else
+            {
+                _wakeups.Request(address);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"pending delivery to {address} failed: {ex.Message}");
         }
     }
 
@@ -383,7 +442,8 @@ public sealed class BrokerServer : IAsyncDisposable
 
     private static string AutomaticBase(string? cwd, string kind)
     {
-        var folder = string.IsNullOrWhiteSpace(cwd) ? "agent" : Path.GetFileName(cwd.TrimEnd('\\', '/'));
+        // cwd may be a Windows or a Linux (WSL) path whatever OS the broker runs on.
+        var folder = string.IsNullOrWhiteSpace(cwd) ? "agent" : cwd.TrimEnd('\\', '/').Split('\\', '/').Last();
         var suffix = "-" + kind;
         return TrimTo(Names.Sanitize(folder), Names.MaxLength - suffix.Length) + suffix;
     }
@@ -426,8 +486,9 @@ public sealed class BrokerServer : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         Stop();
+        // Close every connection before the database goes away; OnClosed still touches the store.
         foreach (var c in _connections.Keys) await c.Peer.DisposeAsync().ConfigureAwait(false);
-        _store.Dispose();
+        lock (_registryLock) _store.Dispose();
     }
 
     private sealed class Connection(RpcPeer peer, bool requiresToken)

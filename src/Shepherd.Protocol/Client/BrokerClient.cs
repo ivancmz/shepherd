@@ -85,6 +85,9 @@ public sealed class BrokerClient : IAsyncDisposable
     public async Task<ReadInboxResult> ReadInboxAsync(ReadInboxParams p, CancellationToken ct = default) =>
         Json.Result(await Call(Methods.ReadInbox, Json.ToNode(p, ProtocolJson.Default.ReadInboxParams), ct), ProtocolJson.Default.ReadInboxResult);
 
+    public Task AckAsync(AckParams p, CancellationToken ct = default) =>
+        Call(Methods.Ack, Json.ToNode(p, ProtocolJson.Default.AckParams), ct);
+
     public async Task<ListAgentsResult> ListAgentsAsync(CancellationToken ct = default) =>
         Json.Result(await Call(Methods.ListAgents, null, ct), ProtocolJson.Default.ListAgentsResult);
 

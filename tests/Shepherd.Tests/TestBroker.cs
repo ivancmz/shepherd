@@ -15,6 +15,7 @@ internal sealed class TestBroker : IAsyncDisposable
     public string PipeName { get; } = "shepherd-test-" + Guid.NewGuid().ToString("N")[..12];
     public string DataDir { get; }
     public List<string> Log { get; } = [];
+    public FakeRunner Runner { get; } = new();
     private BrokerServer _server;
     private Task _run;
 
@@ -41,6 +42,9 @@ internal sealed class TestBroker : IAsyncDisposable
             Node = "pc-test",
             KeepAlive = false,
             Log = s => { lock (Log) Log.Add(s); },
+            Runner = Runner,
+            CodexPath = "codex-test",
+            HerdrPath = "herdr-test",
         });
         return (server, Task.Run(() => server.RunAsync()));
     }
@@ -61,12 +65,14 @@ internal sealed class TestBroker : IAsyncDisposable
     }
 
     /// <summary>Connects and registers an agent.</summary>
-    public async Task<BrokerClient> AgentAsync(string? name, string kind = AgentKinds.Claude, string? sessionKey = null, string? cwd = null)
+    public async Task<BrokerClient> AgentAsync(string? name, string kind = AgentKinds.Claude, string? sessionKey = null,
+        string? cwd = null, bool channel = false, string? herdrPane = null)
     {
         var c = await ConnectAsync();
         await c.RegisterAsync(new RegisterParams
         {
             Name = name, Kind = kind, SessionKey = sessionKey ?? $"{kind}:{Guid.NewGuid():N}", Cwd = cwd,
+            Channel = channel, HerdrPaneId = herdrPane,
         });
         return c;
     }
@@ -118,5 +124,31 @@ internal sealed class DuplexPair : IAsyncDisposable
     {
         await Client.DisposeAsync();
         await Server.DisposeAsync();
+    }
+}
+
+/// <summary>Records external commands instead of running them. Fails the first N calls if asked.</summary>
+public sealed class FakeRunner : ICommandRunner
+{
+    private readonly List<(string File, string[] Args)> _calls = [];
+    public int FailFirst { get; set; }
+
+    public IReadOnlyList<(string File, string[] Args)> Calls
+    {
+        get { lock (_calls) return _calls.ToList(); }
+    }
+
+    public Task<CommandResult> RunAsync(string file, IReadOnlyList<string> args, TimeSpan timeout, CancellationToken ct)
+    {
+        lock (_calls)
+        {
+            _calls.Add((file, args.ToArray()));
+            if (FailFirst > 0)
+            {
+                FailFirst--;
+                return Task.FromResult(new CommandResult(1, "", "simulated failure"));
+            }
+        }
+        return Task.FromResult(new CommandResult(0, "", ""));
     }
 }

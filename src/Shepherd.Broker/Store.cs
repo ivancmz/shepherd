@@ -49,6 +49,7 @@ internal sealed class Store : IDisposable
     private const int SchemaVersion = 1;
     private readonly SqliteConnection _db;
     private readonly Lock _lock = new();
+    private bool _disposed;
 
     public Store(string path)
     {
@@ -83,7 +84,7 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = """
                 INSERT INTO agents(address, name, node, kind, session_key, cwd, herdr_pane_id, thread_id, automatic, channel, created_at, last_seen)
                 VALUES($address, $name, $node, $kind, $sk, $cwd, $pane, $thread, $auto, $channel, $now, $now)
@@ -111,7 +112,7 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = "UPDATE agents SET last_seen=$now, thread_id=COALESCE($thread, thread_id) WHERE address=$a";
             cmd.Parameters.AddWithValue("$now", Now());
             cmd.Parameters.AddWithValue("$thread", (object?)threadId ?? DBNull.Value);
@@ -124,7 +125,7 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = "SELECT * FROM agents WHERE address=$a";
             cmd.Parameters.AddWithValue("$a", address);
             using var r = cmd.ExecuteReader();
@@ -136,7 +137,7 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = "SELECT * FROM agents ORDER BY node, name";
             using var r = cmd.ExecuteReader();
             var list = new List<AgentRow>();
@@ -166,8 +167,9 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             using var tx = _db.BeginTransaction();
-            using (var cmd = _db.CreateCommand())
+            using (var cmd = NewCommand())
             {
                 cmd.Transaction = tx;
                 cmd.CommandText = """
@@ -188,7 +190,7 @@ internal sealed class Store : IDisposable
             }
             foreach (var rcpt in recipients)
             {
-                using var cmd = _db.CreateCommand();
+                using var cmd = NewCommand();
                 cmd.Transaction = tx;
                 cmd.CommandText = "INSERT INTO recipients(message_id, recipient, state, updated_at) VALUES($id, $r, $s, $now)";
                 cmd.Parameters.AddWithValue("$id", m.Id);
@@ -205,7 +207,7 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = "SELECT * FROM messages WHERE id=$id";
             cmd.Parameters.AddWithValue("$id", id);
             using var r = cmd.ExecuteReader();
@@ -217,7 +219,7 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = "SELECT state FROM recipients WHERE message_id=$id AND recipient=$r";
             cmd.Parameters.AddWithValue("$id", messageId);
             cmd.Parameters.AddWithValue("$r", recipient);
@@ -230,7 +232,7 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = """
                 UPDATE recipients SET state=$s, updated_at=$now
                 WHERE message_id=$id AND recipient=$r AND
@@ -250,7 +252,7 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = $"""
                 SELECT m.*, r.state AS rstate FROM recipients r JOIN messages m ON m.id = r.message_id
                 WHERE r.recipient=$r {(unreadOnly ? "AND r.state IN ('queued','notified')" : "")}
@@ -265,11 +267,29 @@ internal sealed class Store : IDisposable
         }
     }
 
+    /// <summary>Messages still in <c>queued</c> for a recipient (to be announced by a wake-up).</summary>
+    public List<(string Id, string From)> QueuedFor(string recipient)
+    {
+        lock (_lock)
+        {
+            using var cmd = NewCommand();
+            cmd.CommandText = """
+                SELECT m.id, m.from_addr FROM recipients r JOIN messages m ON m.id = r.message_id
+                WHERE r.recipient=$r AND r.state='queued' ORDER BY m.created_at, m.id
+                """;
+            cmd.Parameters.AddWithValue("$r", recipient);
+            using var r = cmd.ExecuteReader();
+            var list = new List<(string, string)>();
+            while (r.Read()) list.Add((r.GetString(0), r.GetString(1)));
+            return list;
+        }
+    }
+
     public int CountUnread(string? recipient = null)
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = "SELECT COUNT(*) FROM recipients WHERE state IN ('queued','notified')" + (recipient is null ? "" : " AND recipient=$r");
             if (recipient is not null) cmd.Parameters.AddWithValue("$r", recipient);
             return Convert.ToInt32(cmd.ExecuteScalar(), CultureInfo.InvariantCulture);
@@ -281,7 +301,7 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = """
                 SELECT DISTINCT r.recipient FROM messages m JOIN recipients r ON r.message_id = m.id
                 WHERE m.from_addr=$f AND m.kind='request' AND r.state <> 'answered' ORDER BY r.recipient
@@ -298,7 +318,7 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = "SELECT COUNT(*) FROM messages m JOIN recipients r ON r.message_id=m.id WHERE m.kind='request' AND r.state <> 'answered'";
             return Convert.ToInt32(cmd.ExecuteScalar(), CultureInfo.InvariantCulture);
         }
@@ -309,7 +329,7 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = """
                 DELETE FROM messages WHERE created_at < $cut AND NOT EXISTS
                     (SELECT 1 FROM recipients r WHERE r.message_id = messages.id AND r.state IN ('queued','notified'))
@@ -350,11 +370,26 @@ internal sealed class Store : IDisposable
     {
         lock (_lock)
         {
-            using var cmd = _db.CreateCommand();
+            using var cmd = NewCommand();
             cmd.CommandText = sql;
             cmd.ExecuteNonQuery();
         }
     }
 
-    public void Dispose() => _db.Dispose();
+    /// <summary>Waits for any in-flight command, then closes. Later calls throw <see cref="ObjectDisposedException"/>.</summary>
+    public void Dispose()
+    {
+        lock (_lock)
+        {
+            _disposed = true;
+            _db.Dispose();
+        }
+    }
+
+    /// <summary>Every command goes through here so a closed store fails uniformly.</summary>
+    private SqliteCommand NewCommand()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return _db.CreateCommand();
+    }
 }

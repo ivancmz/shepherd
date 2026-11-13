@@ -13,6 +13,7 @@ public static class Methods
     public const string ReadInbox = "read_inbox";
     public const string ListAgents = "list_agents";
     public const string Status = "status";
+    public const string Ack = "ack";
     public const string Shutdown = "shutdown";
 
     // Broker → client notifications.
@@ -82,6 +83,9 @@ public sealed record ReplyParams(string MessageId, string Body, List<FileRef>? R
 
 public sealed record SendResult(string MessageId, string ThreadId, List<string> To);
 
+/// <summary>Marks messages read after the client surfaced them to the agent (Claude channel).</summary>
+public sealed record AckParams(List<string> MessageIds);
+
 public sealed record ReadInboxParams(bool UnreadOnly = true, int Limit = 20);
 
 public sealed record InboxMessage
@@ -112,6 +116,8 @@ public sealed record AgentInfo
     public string? Cwd { get; init; }
     public string? HerdrPaneId { get; init; }
     public bool Channel { get; init; }
+    /// <summary>A new message can reach the agent without it polling (channel, codex queue, herdr).</summary>
+    public bool Wakeable { get; init; }
     public int Unread { get; init; }
     /// <summary>Addresses this agent sent requests to that are still unanswered.</summary>
     public List<string> WaitingOn { get; init; } = [];
@@ -144,6 +150,7 @@ public sealed record StatusResult
 [JsonSerializable(typeof(ReplyParams))]
 [JsonSerializable(typeof(SendResult))]
 [JsonSerializable(typeof(ReadInboxParams))]
+[JsonSerializable(typeof(AckParams))]
 [JsonSerializable(typeof(ReadInboxResult))]
 [JsonSerializable(typeof(InboxMessage))]
 [JsonSerializable(typeof(ListAgentsResult))]

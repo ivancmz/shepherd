@@ -144,6 +144,65 @@ public class McpServerTests
     }
 
     [Fact]
+    public async Task Channel_session_gets_messages_pushed_and_acked()
+    {
+        await using var b = await TestBroker.StartAsync();
+        var pushed = new TaskCompletionSource<JsonNode?>();
+        await using var dev = await Shim.StartAsync(b, new()
+        {
+            ["CLAUDE_CODE_SESSION_ID"] = "s-dev", ["SHEPHERD_NAME"] = "dev", ["SHEPHERD_CHANNEL"] = "1",
+        });
+        dev.Client.OnNotification = (m, p) =>
+        {
+            if (m == "notifications/claude/channel") pushed.TrySetResult(p);
+            return Task.CompletedTask;
+        };
+        await dev.CallAsync("whoami", new JsonObject()); // registered
+
+        await using var lead = await b.AgentAsync("lead");
+        var sent = await lead.SendAsync(new SendParams
+        {
+            To = ["dev"], Body = "please check", Kind = MessageKinds.Request, Subject = "check",
+            Refs = [new FileRef(@"C:\r\a.c", Lines: "3")],
+        });
+
+        var ev = (await pushed.Task.WaitAsync(TimeSpan.FromSeconds(5)))!;
+        Assert.Equal("please check\n\nFiles referenced:\n- C:\\r\\a.c (lines 3)", ev["content"]!.GetValue<string>());
+        var meta = ev["meta"]!;
+        Assert.Equal("lead@pc-test", meta["from"]!.GetValue<string>());
+        Assert.Equal("request", meta["kind"]!.GetValue<string>());
+        Assert.Equal(sent.MessageId, meta["message_id"]!.GetValue<string>());
+        Assert.Equal("check", meta["subject"]!.GetValue<string>());
+        Assert.All(meta.AsObject(), kv => Assert.Matches("^[a-z_]+$", kv.Key)); // Claude drops other keys
+
+        // Acked by the shim → read, so it does not show up again in read_inbox.
+        await BrokerTests.WaitUntil(async () => (await lead.ListAgentsAsync()).Agents.Single(a => a.Name == "dev").Unread == 0);
+        Assert.Empty(b.Runner.Calls);
+    }
+
+    [Fact]
+    public async Task Channel_capability_only_for_claude_with_channel_flag()
+    {
+        await using var b = await TestBroker.StartAsync();
+        foreach (var (env, client, expected) in new (Dictionary<string, string?>, string, bool)[]
+        {
+            (new() { ["CLAUDE_CODE_SESSION_ID"] = "a", ["SHEPHERD_CHANNEL"] = "1" }, "claude-code", true),
+            (new() { ["CLAUDE_CODE_SESSION_ID"] = "b" }, "claude-code", false),
+            (new() { ["SHEPHERD_CHANNEL"] = "1" }, "codex-mcp-client", false),
+        })
+        {
+            var pair = await DuplexPair.CreateAsync();
+            await using var server = new McpServer(pair.Server, pair.Server, b.PipeName, _ => { }, k => env.GetValueOrDefault(k));
+            _ = Task.Run(server.RunAsync);
+            await using var c = new RpcPeer(new LineChannel(pair.Client, pair.Client), "c");
+            _ = Task.Run(c.RunAsync);
+            var init = await c.RequestAsync("initialize", new JsonObject { ["clientInfo"] = new JsonObject { ["name"] = client } });
+            Assert.Equal(expected, init!["capabilities"]!["experimental"]?["claude/channel"] is not null);
+            Assert.Equal(expected, init["instructions"]!.GetValue<string>().Contains("<channel", StringComparison.Ordinal));
+        }
+    }
+
+    [Fact]
     public async Task Tool_errors_are_reported_as_tool_results()
     {
         await using var b = await TestBroker.StartAsync();
