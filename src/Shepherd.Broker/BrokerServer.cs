@@ -35,6 +35,9 @@ public sealed record BrokerOptions
     /// <c>off</c>, or <c>address:port</c>. Defaults to <c>SHEPHERD_TCP</c>, else <c>auto</c>.
     /// </summary>
     public string? TcpBind { get; init; }
+
+    /// <summary>How often <c>auto</c> re-checks the WSL interface (it may appear after logon or change).</summary>
+    public TimeSpan TcpWatchInterval { get; init; } = TimeSpan.FromSeconds(30);
 }
 
 /// <summary>
@@ -164,41 +167,63 @@ public sealed class BrokerServer : IAsyncDisposable
         var bind = _opt.TcpBind ?? Environment.GetEnvironmentVariable("SHEPHERD_TCP") ?? "auto";
         if (bind.Equals("off", StringComparison.OrdinalIgnoreCase)) return;
 
-        IPEndPoint? ep;
-        if (bind.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        if (!bind.Equals("auto", StringComparison.OrdinalIgnoreCase))
         {
-            var ip = WslInterfaceAddress();
-            if (ip is null)
-            {
-                Log("TCP for WSL disabled: no 'vEthernet (WSL)' interface (WSL not running, or networkingMode=mirrored: set SHEPHERD_TCP=127.0.0.1:47321)");
-                return;
-            }
-            ep = new IPEndPoint(ip, Endpoints.DefaultTcpPort);
-        }
-        else if (!IPEndPoint.TryParse(bind, out ep))
-        {
-            Log($"invalid SHEPHERD_TCP '{bind}'; TCP disabled");
+            if (IPEndPoint.TryParse(bind, out var fixedEp)) Listen(fixedEp, ct);
+            else Log($"invalid SHEPHERD_TCP '{bind}'; TCP disabled");
             return;
         }
 
+        // auto: at logon WSL is usually not running yet, and a WSL restart can change the
+        // address of 'vEthernet (WSL)'. Watch it and (re)listen whenever it appears or changes.
+        _ = Task.Run(async () =>
+        {
+            var warned = false;
+            while (!ct.IsCancellationRequested)
+            {
+                var ip = WslInterfaceAddress();
+                var current = TcpEndpoint?.Address;
+                if (ip is null)
+                {
+                    if (!warned) Log("waiting for the 'vEthernet (WSL)' interface to listen for WSL nodes (WSL not started yet; with networkingMode=mirrored set SHEPHERD_TCP=127.0.0.1:47321)");
+                    warned = true;
+                }
+                else if (!ip.Equals(current))
+                {
+                    if (current is not null) Log($"WSL interface changed {current} -> {ip}; re-listening");
+                    Listen(new IPEndPoint(ip, Endpoints.DefaultTcpPort), ct);
+                    warned = false;
+                }
+                try { await Task.Delay(_opt.TcpWatchInterval, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+            }
+        }, ct);
+    }
+
+    /// <summary>Starts (or replaces) the TCP listener and publishes its endpoint for WSL shims.</summary>
+    private void Listen(IPEndPoint ep, CancellationToken ct)
+    {
+        _tcp?.Stop();
+        TcpListener listener;
         try
         {
-            _tcp = new TcpListener(ep);
-            _tcp.Start();
+            listener = new TcpListener(ep);
+            listener.Start();
         }
         catch (SocketException ex)
         {
             Log($"cannot listen on {ep}: {ex.Message}");
             _tcp = null;
+            TcpEndpoint = null;
             return;
         }
-        TcpEndpoint = (IPEndPoint)_tcp.LocalEndpoint;
+        _tcp = listener;
+        TcpEndpoint = (IPEndPoint)listener.LocalEndpoint;
         var file = Path.Combine(_opt.DataDir, Endpoints.EndpointFileName);
         File.WriteAllText(file, System.Text.Json.JsonSerializer.Serialize(
             new BrokerEndpoint(TcpEndpoint.Address.ToString(), TcpEndpoint.Port), ProtocolJson.Default.BrokerEndpoint));
         Log($"listening for WSL nodes on tcp {TcpEndpoint} (token required)");
 
-        var listener = _tcp;
         _ = Task.Run(async () =>
         {
             while (!ct.IsCancellationRequested)
@@ -210,7 +235,7 @@ public sealed class BrokerServer : IAsyncDisposable
                 }
                 catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or SocketException)
                 {
-                    return;
+                    return; // stopped or replaced
                 }
                 client.NoDelay = true;
                 Accept(client.GetStream(), "tcp", requiresToken: true);
