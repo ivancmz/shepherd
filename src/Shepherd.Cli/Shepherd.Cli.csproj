@@ -4,6 +4,8 @@
     <OutputType>Exe</OutputType>
     <RootNamespace>Shepherd.Cli</RootNamespace>
     <AssemblyName>shepherd</AssemblyName>
+    <!-- LibraryImport (user PATH change broadcast) generates unsafe marshalling code. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <!-- Publishing (with a RID) builds NativeAOT and pins the patched runtime: 10.0.12 (the

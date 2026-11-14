@@ -21,6 +21,11 @@ internal sealed record SetupContext
     public DateTime Now { get; init; } = DateTime.Now;
     public Action<string> Out { get; init; } = Console.WriteLine;
 
+    /// <summary>Linux: directory for the <c>shepherd</c> symlink (normally ~/.local/bin). Null skips it.</summary>
+    public string? UserBinDir { get; init; }
+    /// <summary>Windows: adds/removes a directory in the user's PATH; returns true if it changed. Null skips it.</summary>
+    public Func<string, bool, bool>? EditUserPath { get; init; }
+
     public static SetupContext Default() => new()
     {
         Home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -29,6 +34,8 @@ internal sealed record SetupContext
         Runner = new CliProcessRunner(),
         ClaudePath = Tools.Claude(),
         CodexPath = ToolPaths.Codex(),
+        UserBinDir = OperatingSystem.IsWindows() ? null : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin"),
+        EditUserPath = OperatingSystem.IsWindows() ? UserPath.Edit : null,
     };
 }
 
@@ -72,6 +79,10 @@ internal sealed class Setup(SetupContext ctx)
             ? "Codex: not found, skipped"
             : $"Codex: codex mcp add shepherd -- \"{Path.Combine(target, ExeName)}\" mcp, then default_tools_approval_mode = \"approve\" for shepherd only  (backup of {CodexToml})");
         plan.Add($"rule for other agents in {ClaudeMd}{(ctx.CodexPath is null ? "" : $" and {AgentsMd}")} between {BlockBegin} / {BlockEnd}");
+        if (ctx.Windows && ctx.EditUserPath is not null)
+            plan.Add($"`shepherd` on PATH: {Path.Combine(ctx.InstallRoot, ExeName)} (stable copy) and {ctx.InstallRoot} in the user PATH");
+        if (!ctx.Windows && ctx.UserBinDir is not null)
+            plan.Add($"`shepherd` on PATH: symlink {Path.Combine(ctx.UserBinDir, ExeName)} -> {Path.Combine(target, ExeName)}");
         return plan;
     }
 
@@ -81,6 +92,7 @@ internal sealed class Setup(SetupContext ctx)
         var exe = Path.Combine(target, ExeName);
         Install(target);
         ctx.Out($"installed {exe}");
+        PutOnPath(target);
 
         if (ctx.ClaudePath is not null)
         {
@@ -118,6 +130,7 @@ internal sealed class Setup(SetupContext ctx)
             await RunAsync(ctx.CodexPath, ["mcp", "remove", "shepherd"], ignoreFailure: true, ct);
             RemoveBlock(AgentsMd);
         }
+        RemoveFromPath();
         ctx.Out($"shepherd unregistered. Installed binaries stay in {ctx.InstallRoot} (delete them when no agent uses them).");
         return 0;
     }
@@ -146,6 +159,54 @@ internal sealed class Setup(SetupContext ctx)
         if (!ctx.Windows && !OperatingSystem.IsWindows()) File.SetUnixFileMode(Path.Combine(target, ExeName),
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
             UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+    }
+
+    /// <summary>
+    /// Windows: a stable copy in the install root (on PATH). An in-use copy (e.g. a running
+    /// `launch`) is renamed out of the way first: Windows allows renaming a running executable.
+    /// Linux: a symlink in ~/.local/bin to the versioned binary.
+    /// </summary>
+    private void PutOnPath(string target)
+    {
+        if (ctx.Windows && ctx.EditUserPath is not null)
+        {
+            foreach (var name in NativeLibs.Prepend(ExeName))
+            {
+                var dst = Path.Combine(ctx.InstallRoot, name);
+                try
+                {
+                    File.Copy(Path.Combine(target, name), dst, overwrite: true);
+                }
+                catch (IOException)
+                {
+                    File.Move(dst, $"{dst}.old-{ctx.Now.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture)}", overwrite: true);
+                    File.Copy(Path.Combine(target, name), dst);
+                }
+            }
+            foreach (var old in Directory.EnumerateFiles(ctx.InstallRoot, "*.old-*"))
+                try { File.Delete(old); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            if (ctx.EditUserPath(ctx.InstallRoot, true))
+                ctx.Out($"added {ctx.InstallRoot} to your user PATH (open a new terminal to use `shepherd`)");
+        }
+        else if (!ctx.Windows && ctx.UserBinDir is not null)
+        {
+            Directory.CreateDirectory(ctx.UserBinDir);
+            var link = Path.Combine(ctx.UserBinDir, ExeName);
+            if (File.Exists(link) || new FileInfo(link).LinkTarget is not null) File.Delete(link);
+            File.CreateSymbolicLink(link, Path.Combine(target, ExeName));
+            ctx.Out($"linked {link}");
+        }
+    }
+
+    private void RemoveFromPath()
+    {
+        if (ctx.Windows && ctx.EditUserPath is not null && ctx.EditUserPath(ctx.InstallRoot, false))
+            ctx.Out($"removed {ctx.InstallRoot} from your user PATH");
+        if (!ctx.Windows && ctx.UserBinDir is not null)
+        {
+            var link = Path.Combine(ctx.UserBinDir, ExeName);
+            if (new FileInfo(link).LinkTarget is { } t && t.Contains("shepherd", StringComparison.Ordinal)) File.Delete(link);
+        }
     }
 
     private async Task RunAsync(string file, string[] args, bool ignoreFailure, CancellationToken ct)

@@ -252,7 +252,7 @@ internal static class Program
         return Print($"""
             broker {s.BrokerVersion} on node {s.Node}, up since {s.StartedAt.LocalDateTime:yyyy-MM-dd HH:mm:ss}
             data: {s.DataDir}
-            logs: {Path.Combine(s.DataDir, "broker.log")}, {Path.Combine(s.DataDir, "logs")} (shims), {Path.Combine(s.DataDir, "audit-*.jsonl")} (messages)
+            logs: {Join(s.DataDir, "broker.log")}, {Join(s.DataDir, "logs")} (shims), {Join(s.DataDir, "audit-*.jsonl")} (messages)
             agents: {s.Online} online / {s.Agents} known
             unread messages: {s.Unread}, pending requests: {s.PendingRequests}
             """);
@@ -276,6 +276,9 @@ internal static class Program
         }
         return (pos, flags);
     }
+
+    /// <summary>Joins with the separator of <paramref name="dir"/> (a Windows path seen from WSL stays Windows-style).</summary>
+    private static string Join(string dir, string name) => dir.Contains('\\') ? dir.TrimEnd('\\') + "\\" + name : Path.Combine(dir, name);
 
     private static int Print(string s)
     {

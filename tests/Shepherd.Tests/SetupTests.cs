@@ -134,6 +134,57 @@ public sealed class SetupTests : IDisposable
         Assert.Equal(ExistingClaudeMd, File.ReadAllText(Path.Combine(Home, ".claude", "CLAUDE.md")));
     }
 
+    [Fact]
+    public async Task Windows_puts_a_stable_copy_on_the_user_path_and_undo_removes_it()
+    {
+        var path = new List<string>();
+        bool Edit(string dir, bool add)
+        {
+            if (add == path.Contains(dir)) return false;
+            if (add) path.Add(dir); else path.Remove(dir);
+            return true;
+        }
+        Setup Make() => new(new SetupContext
+        {
+            Home = Home, SourceDir = Source, InstallRoot = Bin, Runner = _runner, ClaudePath = "claude", CodexPath = "codex",
+            Windows = true, Out = _ => { }, EditUserPath = Edit,
+        });
+
+        await Make().ApplyAsync();
+        Assert.Equal("fake exe v1", File.ReadAllText(Path.Combine(Bin, "shepherd.exe")));
+        Assert.True(File.Exists(Path.Combine(Bin, "e_sqlite3.dll")));
+        Assert.Equal([Bin], path);
+
+        // A running `launch` keeps the stable copy open: it is moved aside, never blocking the update.
+        File.WriteAllText(Path.Combine(Source, "shepherd.exe"), "fake exe v2");
+        using (new FileStream(Path.Combine(Bin, "shepherd.exe"), FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete))
+            await Make().ApplyAsync();
+        Assert.Equal("fake exe v2", File.ReadAllText(Path.Combine(Bin, "shepherd.exe")));
+        Assert.Equal([Bin], path);
+
+        await Make().UndoAsync();
+        Assert.Empty(path);
+    }
+
+    [Fact]
+    public async Task Linux_links_shepherd_into_the_user_bin()
+    {
+        if (OperatingSystem.IsWindows()) return; // symlinks need privileges on Windows; covered when run in WSL
+        File.WriteAllText(Path.Combine(Source, "shepherd"), "fake linux exe");
+        File.WriteAllText(Path.Combine(Source, "libe_sqlite3.so"), "fake so");
+        var userBin = Path.Combine(_root, "local-bin");
+        var setup = new Setup(new SetupContext
+        {
+            Home = Home, SourceDir = Source, InstallRoot = Bin, Runner = _runner, ClaudePath = null, CodexPath = null,
+            Windows = false, Out = _ => { }, UserBinDir = userBin,
+        });
+        await setup.ApplyAsync();
+        var link = new FileInfo(Path.Combine(userBin, "shepherd"));
+        Assert.Equal(Path.Combine(setup.InstallDir(), "shepherd"), link.LinkTarget);
+        await setup.UndoAsync();
+        Assert.False(File.Exists(link.FullName));
+    }
+
     [Theory]
     [InlineData("a\n\n<!-- shepherd:begin -->\nx\n<!-- shepherd:end -->\n", "a\n")]
     [InlineData("<!-- shepherd:begin -->\nx\n<!-- shepherd:end -->\n", "")]
