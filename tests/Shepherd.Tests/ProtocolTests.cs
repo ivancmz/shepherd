@@ -51,6 +51,19 @@ public class ProtocolTests
     }
 
     [Fact]
+    public void File_log_appends_and_rotates()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "shepherd-log-" + Guid.NewGuid().ToString("N")[..8]);
+        var log = new FileLog(Path.Combine(dir, "x.log"), "[1] ", maxBytes: 200);
+        for (var i = 0; i < 10; i++) log.Write($"line {i}");
+        Assert.True(File.Exists(log.FilePath + ".1"));
+        var last = File.ReadAllText(log.FilePath);
+        Assert.Contains("[1] line 9", last);
+        Assert.True(new FileInfo(log.FilePath).Length < 300);
+        Directory.Delete(dir, true);
+    }
+
+    [Fact]
     public async Task Rpc_peers_talk_both_ways()
     {
         await using var pair = await DuplexPair.CreateAsync();

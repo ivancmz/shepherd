@@ -515,9 +515,10 @@ public sealed class BrokerServer : IAsyncDisposable
         foreach (var r in recipients)
         {
             var hasChannel = false;
-            if (_live.TryGetValue(r, out var target))
+            var live = _live.TryGetValue(r, out var target);
+            if (live)
             {
-                hasChannel = target.Channel;
+                hasChannel = target!.Channel;
                 try
                 {
                     await target.Peer.NotifyAsync(Methods.MessageNew,
@@ -531,6 +532,7 @@ public sealed class BrokerServer : IAsyncDisposable
                 }
             }
             if (!hasChannel) _wakeups.Request(r);
+            Log($"msg {msg.Id[^8..]} {msg.Kind} {msg.From} -> {r}: {(hasChannel ? "pushed to channel" : live ? "online, wake-up requested" : "offline, wake-up requested")}");
         }
     }
 

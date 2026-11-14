@@ -14,6 +14,12 @@ public interface ICommandRunner
     Task<CommandResult> RunAsync(string file, IReadOnlyList<string> args, TimeSpan timeout, CancellationToken ct);
 }
 
+public static class BrokerRunners
+{
+    /// <summary>The real runner (no shell; arguments passed verbatim).</summary>
+    public static ICommandRunner Process() => new ProcessRunner();
+}
+
 internal sealed class ProcessRunner : ICommandRunner
 {
     public async Task<CommandResult> RunAsync(string file, IReadOnlyList<string> args, TimeSpan timeout, CancellationToken ct)

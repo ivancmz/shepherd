@@ -13,6 +13,10 @@ internal static class Program
         shepherd — message bus between coding agents
 
         Usage:
+          shepherd setup [--dry-run] [--yes] [--autostart] [--undo]
+                                                Install and register shepherd for Claude Code and Codex
+          shepherd launch claude|codex [--name <n>] [--prompt <text>] [--auto-confirm] [-- <agent args>]
+                                                Start an agent connected to the bus
           shepherd mcp                          MCP server over stdio (for Claude Code / Codex)
           shepherd send <to>[,<to>...] <text>   Send a message as the user [--request] [--subject <s>]
           shepherd inbox [--all] [--limit <n>]  Read the user's messages (marks them read)
@@ -20,6 +24,7 @@ internal static class Program
           shepherd agents                       List agents
           shepherd status                       Broker status
           shepherd broker run                   Run the broker in the foreground
+          shepherd broker start                 Start the broker in the background (if not running)
           shepherd broker stop                  Stop the running broker
           shepherd firewall                     Show the Windows Firewall rule WSL agents need (does not apply it)
           shepherd version
@@ -62,6 +67,8 @@ internal static class Program
                 "agents" => await AgentsAsync(),
                 "status" => await StatusAsync(),
                 "firewall" => Firewall(),
+                "setup" => await SetupAsync(args.Skip(1).ToArray()),
+                "launch" => await LaunchAsync(args.Skip(1).ToArray()),
                 "version" or "--version" => Print(typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.0.0"),
                 null or "help" or "--help" or "-h" => Print(Usage),
                 var other => Fail($"unknown command '{other}'\n\n{Usage}"),
@@ -71,16 +78,75 @@ internal static class Program
         {
             return Fail(ex.Message);
         }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            return Fail(ex.Message);
+        }
+    }
+
+    // ------------------------------------------------------------ setup/launch
+
+    private static async Task<int> SetupAsync(string[] args)
+    {
+        var (_, flags) = Parse(args);
+        var setup = new Setup(SetupContext.Default());
+        if (flags.ContainsKey("--undo"))
+        {
+            Autostart.Disable();
+            return await setup.UndoAsync();
+        }
+
+        Console.WriteLine("shepherd setup will:");
+        foreach (var step in setup.Plan()) Console.WriteLine($"  - {step}");
+        var autostart = flags.ContainsKey("--autostart") && OperatingSystem.IsWindows();
+        if (autostart) Console.WriteLine("  - start the broker at logon (HKCU\\...\\Run\\shepherd-broker)");
+        Console.WriteLine("Each edited file is backed up first (*.bak-shepherd-<date>). `shepherd setup --undo` reverts it.");
+        if (flags.ContainsKey("--dry-run")) return 0;
+        if (!flags.ContainsKey("--yes"))
+        {
+            if (Console.IsInputRedirected) return Fail("confirmation needed: run again with --yes");
+            Console.Write("Apply? [y/N] ");
+            if (Console.ReadLine()?.Trim().ToLowerInvariant() is not ("y" or "yes" or "s" or "si" or "sí")) return Print("Nothing changed.");
+        }
+        var rc = await setup.ApplyAsync();
+        if (rc == 0 && autostart) Autostart.Enable(Path.Combine(setup.InstallDir(), "shepherd.exe"));
+        return rc;
+    }
+
+    private static async Task<int> LaunchAsync(string[] args)
+    {
+        var dash = Array.IndexOf(args, "--");
+        var own = dash < 0 ? args : args[..dash];
+        var rest = dash < 0 ? [] : args[(dash + 1)..];
+        var (pos, flags) = Parse(own, "--name", "--prompt");
+        if (pos.Count != 1) return Fail("usage: shepherd launch claude|codex [--name <n>] [--prompt <text>] [--auto-confirm] [-- <agent args>]");
+        return await Launch.RunAsync(new LaunchOptions
+        {
+            Agent = pos[0],
+            Name = flags.GetValueOrDefault("--name")?.ToLowerInvariant(),
+            Prompt = flags.GetValueOrDefault("--prompt"),
+            AutoConfirm = flags.ContainsKey("--auto-confirm"),
+            Passthrough = rest.ToList(),
+        });
     }
 
     // ------------------------------------------------------------------ mcp
 
     private static async Task<int> RunMcpAsync()
     {
-        // stdout carries JSON-RPC only; diagnostics go to stderr (Claude/Codex keep it in their logs).
+        // stdout carries JSON-RPC only. Diagnostics go to stderr (Claude/Codex keep it in their own
+        // logs) and to <data>/logs/mcp-<date>.log, one line per event prefixed with the shim's pid.
         var stdin = Console.OpenStandardInput();
         var stdout = Console.OpenStandardOutput();
-        void Log(string s) => Console.Error.WriteLine($"[shepherd {DateTime.Now:HH:mm:ss}] {s}");
+        var logDir = Path.Combine(Endpoints.DataDir(), "logs");
+        FileLog.Prune(logDir, TimeSpan.FromDays(14));
+        var file = new FileLog(Path.Combine(logDir, $"mcp-{DateTime.Now:yyyy-MM-dd}.log"), $"[{Environment.ProcessId}] ");
+        void Log(string s)
+        {
+            Console.Error.WriteLine($"[shepherd {DateTime.Now:HH:mm:ss}] {s}");
+            file.Write(s);
+        }
+        Log($"shim {typeof(Program).Assembly.GetName().Version?.ToString(3)} started ({Environment.ProcessPath}); node {Names.LocalNode()}");
         await using var server = new McpServer(stdin, stdout, ct => BrokerClient.ConnectAsync("mcp", ct), Log);
         await server.RunAsync();
         return 0;
@@ -99,24 +165,20 @@ internal static class Program
                 if (mutex is null) return Fail($"a broker is already running for pipe '{pipe}'");
                 var dataDir = Endpoints.DataDir();
                 Directory.CreateDirectory(dataDir);
-                var logPath = Path.Combine(dataDir, "broker.log");
-                await using var logFile = new StreamWriter(new FileStream(logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) { AutoFlush = true };
-                var logLock = new Lock();
-                void Log(string s)
-                {
-                    var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {s}";
-                    lock (logLock)
-                    {
-                        logFile.WriteLine(line);
-                        if (!Console.IsErrorRedirected) Console.Error.WriteLine(line);
-                    }
-                }
+                var log = new FileLog(Path.Combine(dataDir, "broker.log"), echoToStderr: !Console.IsErrorRedirected);
+                void Log(string s) => log.Write(s);
                 await using var broker = new BrokerServer(new BrokerOptions { PipeName = pipe, DataDir = dataDir, Log = Log });
                 using var cts = new CancellationTokenSource();
                 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
                 await broker.RunAsync(cts.Token);
                 Log("broker stopped");
                 return 0;
+            }
+            case "start":
+            {
+                if (Endpoints.IsWsl) return Fail("the broker runs on Windows; WSL agents connect to it");
+                await using var c = await BrokerClient.ConnectOrSpawnAsync(Endpoints.PipeName(), "cli");
+                return Print($"Broker running (node {c.Hello?.Node}).");
             }
             case "stop":
             {
@@ -126,7 +188,7 @@ internal static class Program
                 return Print("Broker stopping.");
             }
             default:
-                return Fail("usage: shepherd broker run|stop");
+                return Fail("usage: shepherd broker run|start|stop");
         }
     }
 
@@ -190,6 +252,7 @@ internal static class Program
         return Print($"""
             broker {s.BrokerVersion} on node {s.Node}, up since {s.StartedAt.LocalDateTime:yyyy-MM-dd HH:mm:ss}
             data: {s.DataDir}
+            logs: {Path.Combine(s.DataDir, "broker.log")}, {Path.Combine(s.DataDir, "logs")} (shims), {Path.Combine(s.DataDir, "audit-*.jsonl")} (messages)
             agents: {s.Online} online / {s.Agents} known
             unread messages: {s.Unread}, pending requests: {s.PendingRequests}
             """);
