@@ -1,0 +1,102 @@
+# Builds the NativeAOT `shepherd` executable for Windows and Linux and publishes a GitHub release.
+#
+# Trigger: push a tag `vX.Y.Z` (git tag v0.1.0 && git push origin v0.1.0). The version comes from
+# the tag. Run it by hand (workflow_dispatch) to build and test without publishing a release:
+# the packages are kept as workflow artifacts.
+#
+# NativeAOT does not cross-compile between operating systems, so each RID builds on its own runner.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+          - os: ubuntu-latest
+            rid: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v="0.0.0-dev.${GITHUB_RUN_NUMBER}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Linux toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+
+      - name: Test
+        if: runner.os == 'Windows'
+        run: dotnet test Shepherd.slnx -c Release
+
+      - name: Publish
+        shell: bash
+        run: >
+          dotnet publish src/Shepherd.Cli/Shepherd.Cli.csproj -c Release -r ${{ matrix.rid }}
+          -p:Version=${{ steps.ver.outputs.version }} -o out
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          name="shepherd-${{ steps.ver.outputs.version }}-${{ matrix.rid }}"
+          mkdir -p "dist/$name"
+          cp README.md LICENSE "dist/$name/"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp out/shepherd.exe out/e_sqlite3.dll "dist/$name/"
+            (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null)
+            echo "file=dist/$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            cp out/shepherd out/libe_sqlite3.so "dist/$name/"
+            chmod +x "dist/$name/shepherd"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+            echo "file=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.rid }}
+          path: ${{ steps.pkg.outputs.file }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY" --title "shepherd $GITHUB_REF_NAME" --generate-notes
+          $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease)
