@@ -17,7 +17,15 @@ public sealed record BrokerOptions
     public required string DataDir { get; init; }
     public string Node { get; init; } = Names.LocalNode();
     public string Version { get; init; } = typeof(BrokerServer).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+    /// <summary>Read messages and whole audit months older than this are deleted (ADR-0011).</summary>
     public TimeSpan Retention { get; init; } = TimeSpan.FromDays(90);
+    /// <summary>Automatic-name agents disconnected for this long, without unread mail, are forgotten (ADR-0008).</summary>
+    public TimeSpan AgentRetention { get; init; } = TimeSpan.FromDays(14);
+    /// <summary>How often the retention rules run, besides at start-up.</summary>
+    public TimeSpan MaintenanceInterval { get; init; } = TimeSpan.FromDays(1);
+    /// <summary>How often live recipients with unread mail are checked for retries and reminders (ADR-0009).</summary>
+    public TimeSpan SweepInterval { get; init; } = TimeSpan.FromMinutes(1);
+    public WakeTimings Wake { get; init; } = new();
     public bool KeepAlive { get; init; } = true;
     public Action<string>? Log { get; init; }
 
@@ -74,15 +82,14 @@ public sealed class BrokerServer : IAsyncDisposable
         Directory.CreateDirectory(options.DataDir);
         _store = new Store(Path.Combine(options.DataDir, "shepherd.db"));
         _audit = new AuditLog(options.DataDir);
-        var purged = _store.Purge(options.Retention);
-        if (purged > 0) Log($"purged {purged} old messages");
+        Maintain();
         var codex = options.CodexPath ?? ToolPaths.Codex();
         var herdr = options.HerdrPath ?? ToolPaths.Herdr();
         Log($"wake-ups: codex={(string.IsNullOrEmpty(codex) ? "unavailable" : codex)}, herdr={(string.IsNullOrEmpty(herdr) ? "unavailable" : herdr)}");
         var wsl = options.WslPath ?? (OperatingSystem.IsWindows() ? Path.Combine(Environment.SystemDirectory, "wsl.exe") : "");
         _wakeups = new Wakeups(_store, options.Runner ?? new ProcessRunner(), a => _live.ContainsKey(a), Log, options.Node,
             string.IsNullOrEmpty(codex) ? null : codex, string.IsNullOrEmpty(herdr) ? null : herdr,
-            string.IsNullOrEmpty(wsl) ? null : wsl, _stop.Token);
+            string.IsNullOrEmpty(wsl) ? null : wsl, options.Wake, _stop.Token);
         _token = LoadOrCreateToken(options.DataDir);
     }
 
@@ -133,6 +140,7 @@ public sealed class BrokerServer : IAsyncDisposable
         var token = linked.Token;
         Log($"broker {_opt.Version} listening on pipe '{_opt.PipeName}' as node '{_opt.Node}'");
         StartTcp(token);
+        _ = Task.Run(() => SweepLoopAsync(token), token);
         while (!token.IsCancellationRequested)
         {
             // CurrentUserOnly: the pipe's ACL admits only this user (ADR-0004).
@@ -158,6 +166,56 @@ public sealed class BrokerServer : IAsyncDisposable
         }
         _tcp?.Stop();
         foreach (var c in _connections.Keys) c.Peer.Close();
+    }
+
+    // ------------------------------------------------------------------ sweep and retention
+
+    /// <summary>
+    /// Every <see cref="BrokerOptions.SweepInterval"/>: retry failed wake-ups and remind live
+    /// recipients of unread mail (ADR-0009); once per <see cref="BrokerOptions.MaintenanceInterval"/>,
+    /// apply the retention rules (ADR-0011).
+    /// </summary>
+    private async Task SweepLoopAsync(CancellationToken ct)
+    {
+        var lastMaintenance = DateTimeOffset.UtcNow;
+        while (true)
+        {
+            try { await Task.Delay(_opt.SweepInterval, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+            try
+            {
+                foreach (var address in _live.Keys) _wakeups.Sweep(address);
+                _wakeups.ReleaseOrphans();
+                if (DateTimeOffset.UtcNow - lastMaintenance >= _opt.MaintenanceInterval)
+                {
+                    lastMaintenance = DateTimeOffset.UtcNow;
+                    Maintain();
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                return; // broker shutting down
+            }
+            catch (Exception ex)
+            {
+                Log($"sweep failed: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>Retention: old read messages, old audit months (ADR-0011) and stale automatic agents (ADR-0008).</summary>
+    private void Maintain()
+    {
+        var purged = _store.Purge(_opt.Retention);
+        if (purged > 0) Log($"purged {purged} old messages");
+        var months = _audit.Purge(_opt.Retention);
+        if (months > 0) Log($"deleted {months} old audit file(s)");
+        lock (_registryLock)
+        {
+            var stale = _store.StaleAutomaticAgents(_opt.AgentRetention).Where(a => !_live.ContainsKey(a)).ToList();
+            foreach (var a in stale) _store.DeleteAgent(a);
+            if (stale.Count > 0) Log($"forgot {stale.Count} stale automatic agent(s): {string.Join(", ", stale)}");
+        }
     }
 
     // ------------------------------------------------------------------ TCP (WSL nodes)
@@ -309,6 +367,7 @@ public sealed class BrokerServer : IAsyncDisposable
             Methods.ListAgents => ListAgents(),
             Methods.Status => Status(),
             Methods.Shutdown => Shutdown(conn),
+            Methods.Wait => await WaitAsync(conn, Json.Params(p, ProtocolJson.Default.WaitParams), ct).ConfigureAwait(false),
             _ => throw new RpcException(RpcErrors.MethodNotFound, $"method not found: {method}"),
         };
     }
@@ -357,16 +416,37 @@ public sealed class BrokerServer : IAsyncDisposable
         lock (_registryLock)
         {
             string name;
-            var automatic = p.Name is null;
-            if (automatic)
+            bool automatic;
+            if (p.Name is null)
             {
-                var baseName = AutomaticBase(p.Cwd, p.Kind);
-                name = baseName;
-                for (var i = 2; IsHeldByOther(Names.Address(name, node), p.SessionKey); i++)
-                    name = TrimTo(baseName, Names.MaxLength - 1 - i.ToString(System.Globalization.CultureInfo.InvariantCulture).Length) + "-" + i;
+                // ADR-0008: a session that asks for no name gets back the one it had, automatic
+                // or chosen. Otherwise a new automatic name, never one another session has had.
+                if (p.SessionKey is not null && _store.FindBySession(node, p.SessionKey) is { } mine)
+                {
+                    name = mine.Name;
+                    automatic = mine.Automatic;
+                }
+                // ADR-0013: a new session in a herdr pane takes over the role of the pane's
+                // previous occupant (same folder), once that one is gone.
+                else if (p.HerdrPaneId is not null
+                         && _store.PaneOccupants(node, p.Kind, p.HerdrPaneId, p.Cwd).FirstOrDefault(a => !_live.ContainsKey(a.Address)) is { } occupant)
+                {
+                    name = occupant.Name;
+                    automatic = occupant.Automatic;
+                    Log($"{occupant.Address}: new session in herdr pane {p.HerdrPaneId} takes over the name");
+                }
+                else
+                {
+                    automatic = true;
+                    var baseName = AutomaticBase(p.Cwd, p.Kind);
+                    name = baseName;
+                    for (var i = 2; _store.GetAgent(Names.Address(name, node)) is not null; i++)
+                        name = TrimTo(baseName, Names.MaxLength - 1 - i.ToString(System.Globalization.CultureInfo.InvariantCulture).Length) + "-" + i;
+                }
             }
             else
             {
+                automatic = false;
                 name = RequireValidName(p.Name!);
                 if (IsHeldByOther(Names.Address(name, node), p.SessionKey))
                     throw new RpcException(RpcErrors.NameTaken, $"the name '{name}' is in use by another live session");
@@ -382,15 +462,22 @@ public sealed class BrokerServer : IAsyncDisposable
                 previous.Peer.Close();
             }
             // A connection re-registering under a new name releases its old one.
-            if (conn.Address is { } old && old != address && _live.TryGetValue(old, out var mine) && ReferenceEquals(mine, conn))
+            if (conn.Address is { } old && old != address && _live.TryGetValue(old, out var held) && ReferenceEquals(held, conn))
+            {
                 _live.TryRemove(old, out _);
+                // The old row stops belonging to this session, or a later registration without a
+                // name would get it back. An automatic name that never carried mail just goes away.
+                if (_store.GetAgent(old) is { Automatic: true } && !_store.HasMail(old)) _store.DeleteAgent(old);
+                else _store.ReleaseSession(old);
+            }
 
             var existing = _store.GetAgent(address);
             _store.UpsertAgent(new AgentRow
             {
                 Address = address, Name = name, Node = node, Kind = p.Kind, SessionKey = p.SessionKey,
                 Cwd = p.Cwd, HerdrPaneId = p.HerdrPaneId, Distro = p.Distro,
-                ThreadId = existing?.SessionKey == p.SessionKey ? existing?.ThreadId : null,
+                // A thread id only survives while the row stays with the same session (ADR-0008 §6).
+                ThreadId = p.SessionKey is not null && existing?.SessionKey == p.SessionKey ? existing.ThreadId : null,
                 Automatic = automatic, Channel = p.Channel,
             });
             _live[address] = conn;
@@ -408,11 +495,46 @@ public sealed class BrokerServer : IAsyncDisposable
     private JsonNode Identify(Connection conn, IdentifyParams p)
     {
         var address = RequireRegistered(conn);
-        var before = _store.GetAgent(address)?.ThreadId;
-        _store.Touch(address, p.ThreadId);
+        if (p.ThreadId is not { } thread)
+        {
+            _store.Touch(address);
+            return new JsonObject();
+        }
+
+        bool changed;
+        AgentRow? row;
+        lock (_registryLock)
+        {
+            var me = _store.GetAgent(address);
+            var others = _store.AgentsByThread(thread).Where(a => a.Address != address && !_live.ContainsKey(a.Address)).ToList();
+            // ADR-0008 §5: a Codex session under an automatic name that resumes a known thread
+            // takes back the name that thread had; mail sent to the provisional name follows it.
+            var previous = others.FirstOrDefault(a => a.Kind == AgentKinds.Codex && a.Node == me?.Node);
+            if (me is { Kind: AgentKinds.Codex, Automatic: true } && previous is not null
+                && _live.TryGetValue(address, out var cur) && ReferenceEquals(cur, conn))
+            {
+                _store.UpsertAgent(me with { Address = previous.Address, Name = previous.Name, Automatic = previous.Automatic, ThreadId = thread });
+                _store.MoveMail(address, previous.Address);
+                _store.DeleteAgent(address);
+                _live.TryRemove(address, out _);
+                _live[previous.Address] = conn;
+                conn.Address = previous.Address;
+                Log($"{address} resumed thread {thread}: it is {previous.Address} again");
+                address = previous.Address;
+                changed = true;
+            }
+            else
+            {
+                changed = me?.ThreadId != thread;
+                _store.Touch(address, thread);
+            }
+            // A thread belongs to one row only.
+            foreach (var o in others.Where(a => a.Address != address)) _store.ClearThread(o.Address);
+            row = _store.GetAgent(address);
+        }
         // First time we learn a Codex thread: anything still queued can now be announced.
-        if (p.ThreadId is not null && before != p.ThreadId) _wakeups.Request(address);
-        return new JsonObject();
+        if (changed) _wakeups.Request(address);
+        return Json.ToNode(new IdentifyResult(row?.Name, address, row?.Automatic ?? false), ProtocolJson.Default.IdentifyResult);
     }
 
     private JsonNode Ack(Connection conn, AckParams p)
@@ -505,7 +627,7 @@ public sealed class BrokerServer : IAsyncDisposable
             Name = a.Name, Address = a.Address, Node = a.Node, Kind = a.Kind,
             Online = _live.ContainsKey(a.Address) || (a.Kind == AgentKinds.Human && _connections.Keys.Any(c => c.Address == a.Address)),
             Automatic = a.Automatic, Cwd = a.Cwd, HerdrPaneId = a.HerdrPaneId, Channel = a.Channel,
-            Wakeable = (a.Channel && _live.ContainsKey(a.Address)) || _wakeups.CanWake(a),
+            Wakeable = (a.Channel && _live.ContainsKey(a.Address)) || _wakeups.CanWake(a) || _wakeups.HasWaiter(a.Address),
             Unread = _store.CountUnread(a.Address), WaitingOn = _store.WaitingOn(a.Address), LastSeen = a.LastSeen,
         }).ToList();
         return Json.ToNode(new ListAgentsResult(agents), ProtocolJson.Default.ListAgentsResult);
@@ -517,6 +639,19 @@ public sealed class BrokerServer : IAsyncDisposable
         Online = _live.Count, Agents = _store.ListAgents().Count(a => a.Kind != AgentKinds.Human),
         Unread = _store.CountUnread(), PendingRequests = _store.CountPendingRequests(),
     }, ProtocolJson.Default.StatusResult);
+
+    /// <summary>
+    /// ADR-0012: <c>shepherd wait</c> (a Claude Stop hook) parks here until there is mail to
+    /// announce to the agent of that session. The connection does not register as anyone.
+    /// </summary>
+    private async Task<JsonNode> WaitAsync(Connection conn, WaitParams p, CancellationToken ct)
+    {
+        var row = string.IsNullOrEmpty(p.SessionKey) ? null : _store.FindBySession(conn.Node!, p.SessionKey);
+        if (row is null)
+            return Json.ToNode(new WaitResult(Reason: "unknown session"), ProtocolJson.Default.WaitResult);
+        var notice = await _wakeups.WaitAsync(row.Address, ct).ConfigureAwait(false);
+        return Json.ToNode(new WaitResult(notice, notice is null ? "superseded or session gone" : null), ProtocolJson.Default.WaitResult);
+    }
 
     private JsonNode Shutdown(Connection conn)
     {
@@ -576,7 +711,7 @@ public sealed class BrokerServer : IAsyncDisposable
             }
             else
             {
-                _wakeups.Request(address);
+                _wakeups.OnRegistered(address);
             }
         }
         catch (Exception ex)

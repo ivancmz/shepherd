@@ -18,6 +18,7 @@ internal static class Program
           shepherd launch claude|codex [--name <n>] [--prompt <text>] [--auto-confirm] [-- <agent args>]
                                                 Start an agent connected to the bus
           shepherd mcp                          MCP server over stdio (for Claude Code / Codex)
+          shepherd wait                         Claude Code Stop hook: exits 2 with a notice when mail arrives
           shepherd send <to>[,<to>...] <text>   Send a message as the user [--request] [--subject <s>]
           shepherd inbox [--all] [--limit <n>]  Read the user's messages (marks them read)
           shepherd reply <message_id> <text>    Answer a message
@@ -66,6 +67,7 @@ internal static class Program
                 "reply" => await ReplyAsync(args.Skip(1).ToArray()),
                 "agents" => await AgentsAsync(),
                 "status" => await StatusAsync(),
+                "wait" => await Wait.RunAsync(Console.IsInputRedirected ? Console.In : null, Environment.GetEnvironmentVariable, Console.Error),
                 "firewall" => Firewall(),
                 "setup" => await SetupAsync(args.Skip(1).ToArray()),
                 "launch" => await LaunchAsync(args.Skip(1).ToArray()),
@@ -194,6 +196,17 @@ internal static class Program
 
     // ------------------------------------------------------------ user CLI
 
+    /// <summary>
+    /// ADR-0010: sending as the user or reading the user's mailbox is refused inside an agent's
+    /// shell, where the caller is the agent and not the user.
+    /// </summary>
+    private static void RequireUserShell(string command)
+    {
+        if (CallerAgent.Detect() is { } agent)
+            throw new InvalidOperationException(
+                $"`shepherd {command}` acts as the user and cannot run inside an agent ({agent}). Use the shepherd MCP tools (send, reply, read_inbox) instead.");
+    }
+
     private static async Task<BrokerClient> ConnectAsUserAsync()
     {
         var c = await BrokerClient.ConnectAsync("cli");
@@ -205,6 +218,7 @@ internal static class Program
     {
         var (pos, flags) = Parse(args, "--subject");
         if (pos.Count < 2) return Fail("usage: shepherd send <to>[,<to>...] <text> [--request] [--subject <s>]");
+        RequireUserShell("send");
         await using var c = await ConnectAsUserAsync();
         var r = await c.SendAsync(new SendParams
         {
@@ -220,6 +234,7 @@ internal static class Program
     {
         var (_, flags) = Parse(args, "--limit");
         var limit = flags.TryGetValue("--limit", out var l) && int.TryParse(l, CultureInfo.InvariantCulture, out var n) ? n : 20;
+        RequireUserShell("inbox");
         await using var c = await ConnectAsUserAsync();
         var unreadOnly = !flags.ContainsKey("--all");
         var r = await c.ReadInboxAsync(new ReadInboxParams(unreadOnly, limit));
@@ -230,6 +245,7 @@ internal static class Program
     {
         var (pos, _) = Parse(args);
         if (pos.Count < 2) return Fail("usage: shepherd reply <message_id> <text>");
+        RequireUserShell("reply");
         await using var c = await ConnectAsUserAsync();
         var r = await c.ReplyAsync(new ReplyParams(pos[0], string.Join(' ', pos.Skip(1))));
         return Print($"Reply sent to {string.Join(", ", r.To)} ({r.MessageId}).");

@@ -1,6 +1,6 @@
 # ADR-0002: Entrega de mensajes y despertar del destinatario
 
-- Estado: **Aceptada**
+- Estado: **Aceptada**. Los reintentos y recordatorios del aviso están ampliados por [ADR-0009](0009-reintentos-y-recordatorios.md)
 - Fecha: 2026-11-13
 - Relacionada: [ADR-0001](0001-wsl-como-nodo-tcp.md), spike en `spikes/channel-spike/`
 

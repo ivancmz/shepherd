@@ -21,18 +21,22 @@ internal sealed class TestBroker : IAsyncDisposable
 
     private readonly bool _tcp;
 
-    private TestBroker(string dataDir, bool tcp)
+    /// <summary>Adjusts the options of the next (re)start, e.g. shorter timings.</summary>
+    public Func<BrokerOptions, BrokerOptions>? Configure { get; set; }
+
+    private TestBroker(string dataDir, bool tcp, Func<BrokerOptions, BrokerOptions>? configure)
     {
         DataDir = dataDir;
         _tcp = tcp;
+        Configure = configure;
         (_server, _run) = Start();
     }
 
     /// <param name="tcp">Also listen on 127.0.0.1 (random port) like the WSL listener.</param>
-    public static async Task<TestBroker> StartAsync(bool tcp = false)
+    public static async Task<TestBroker> StartAsync(bool tcp = false, Func<BrokerOptions, BrokerOptions>? configure = null)
     {
         var dir = Path.Combine(Path.GetTempPath(), "shepherd-tests", Guid.NewGuid().ToString("N")[..12]);
-        var b = new TestBroker(dir, tcp);
+        var b = new TestBroker(dir, tcp, configure);
         await b.WaitListeningAsync();
         return b;
     }
@@ -50,7 +54,7 @@ internal sealed class TestBroker : IAsyncDisposable
 
     private (BrokerServer, Task) Start()
     {
-        var server = new BrokerServer(new BrokerOptions
+        var options = new BrokerOptions
         {
             PipeName = PipeName,
             DataDir = DataDir,
@@ -62,7 +66,8 @@ internal sealed class TestBroker : IAsyncDisposable
             HerdrPath = "herdr-test",
             WslPath = "wsl-test",
             TcpBind = _tcp ? "127.0.0.1:0" : "off",
-        });
+        };
+        var server = new BrokerServer(Configure?.Invoke(options) ?? options);
         return (server, Task.Run(() => server.RunAsync()));
     }
 

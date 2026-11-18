@@ -1,6 +1,6 @@
 # ADR-0003: Identidad y nombres de los agentes
 
-- Estado: **Aceptada**
+- Estado: **Aceptada**. Los puntos 1 (nombre automático) y 3 están sustituidos por [ADR-0008](0008-el-nombre-sigue-a-la-sesion.md); el punto 5 está matizado por [ADR-0010](0010-la-cli-no-firma-desde-un-agente.md)
 - Fecha: 2026-11-13
 - Relacionadas: [ADR-0001](0001-wsl-como-nodo-tcp.md), [ADR-0002](0002-entrega-y-despertar.md)
 

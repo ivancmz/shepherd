@@ -189,7 +189,9 @@ public sealed class McpServer : IAsyncDisposable
         var sb = new StringBuilder(text);
         if (_link.TakeNotice() is { } notice) sb.Append("\n\nNote: ").Append(notice);
         var unseen = Interlocked.Exchange(ref _unseen, 0);
+        var waiting = _link.TakeMailNotice();
         if (unseen > 0) sb.Append(CultureInfo.InvariantCulture, $"\n\nYou have {unseen} new message(s); use read_inbox.");
+        else if (waiting is not null) sb.Append("\n\nNote: ").Append(waiting).Append("; use read_inbox.");
         return sb.ToString();
     }
 
@@ -233,6 +235,7 @@ public sealed class McpServer : IAsyncDisposable
         var client = await _link.GetAsync(ct).ConfigureAwait(false);
         var r = await client.ReadInboxAsync(new ReadInboxParams(unreadOnly, limit), ct).ConfigureAwait(false);
         Interlocked.Exchange(ref _unseen, 0);
+        _link.TakeMailNotice(); // the agent is reading its mail right now
         return Format.Inbox(r, unreadOnly);
     }
 

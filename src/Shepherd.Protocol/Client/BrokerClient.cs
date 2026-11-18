@@ -136,8 +136,10 @@ public sealed class BrokerClient : IAsyncDisposable
     public async Task<RegisterResult> RegisterAsync(RegisterParams p, CancellationToken ct = default) =>
         Json.Result(await Call(Methods.Register, Json.ToNode(p, ProtocolJson.Default.RegisterParams), ct), ProtocolJson.Default.RegisterResult);
 
-    public Task IdentifyAsync(IdentifyParams p, CancellationToken ct = default) =>
-        Call(Methods.Identify, Json.ToNode(p, ProtocolJson.Default.IdentifyParams), ct);
+    public async Task<IdentifyResult> IdentifyAsync(IdentifyParams p, CancellationToken ct = default) =>
+        await Call(Methods.Identify, Json.ToNode(p, ProtocolJson.Default.IdentifyParams), ct).ConfigureAwait(false) is { } r
+            ? Json.Result(r, ProtocolJson.Default.IdentifyResult)
+            : new IdentifyResult();
 
     public async Task<SendResult> SendAsync(SendParams p, CancellationToken ct = default) =>
         Json.Result(await Call(Methods.Send, Json.ToNode(p, ProtocolJson.Default.SendParams), ct), ProtocolJson.Default.SendResult);
@@ -156,6 +158,11 @@ public sealed class BrokerClient : IAsyncDisposable
 
     public async Task<StatusResult> StatusAsync(CancellationToken ct = default) =>
         Json.Result(await Call(Methods.Status, null, ct), ProtocolJson.Default.StatusResult);
+
+    /// <summary>Waits, with no time limit, until the broker has mail to announce to that session (ADR-0012).</summary>
+    public async Task<WaitResult> WaitAsync(WaitParams p, CancellationToken ct = default) =>
+        Json.Result(await _peer.RequestAsync(Methods.Wait, Json.ToNode(p, ProtocolJson.Default.WaitParams), ct).ConfigureAwait(false),
+            ProtocolJson.Default.WaitResult);
 
     public Task ShutdownAsync(CancellationToken ct = default) => Call(Methods.Shutdown, null, ct);
 

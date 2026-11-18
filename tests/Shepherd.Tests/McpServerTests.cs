@@ -213,6 +213,23 @@ public class McpServerTests
     }
 
     [Fact]
+    public async Task Mail_waiting_at_registration_is_mentioned_once_in_a_tool_result()
+    {
+        await using var b = await TestBroker.StartAsync();
+        await using var lead = await b.AgentAsync("lead");
+        await (await b.AgentAsync("dev", sessionKey: "claude:s5")).DisposeAsync();
+        await lead.SendAsync(new SendParams { To = ["dev"], Body = "while you were away" });
+
+        // No channel and no herdr pane: nothing can wake this session (ADR-0009 §5).
+        await using var shim = await Shim.StartAsync(b, new() { ["CLAUDE_CODE_SESSION_ID"] = "s5" });
+        var (first, _) = await shim.CallAsync("whoami", new JsonObject());
+        Assert.Contains("You are 'dev'", first); // ADR-0008: the name follows the session
+        Assert.Contains("1 unread message(s) waiting; use read_inbox.", first);
+        var (second, _) = await shim.CallAsync("whoami", new JsonObject());
+        Assert.DoesNotContain("unread", second);
+    }
+
+    [Fact]
     public async Task New_mail_is_mentioned_in_the_next_tool_result()
     {
         await using var b = await TestBroker.StartAsync();

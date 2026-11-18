@@ -93,7 +93,7 @@ internal sealed class Store : IDisposable
                 VALUES($address, $name, $node, $kind, $sk, $cwd, $pane, $thread, $auto, $channel, $distro, $now, $now)
                 ON CONFLICT(address) DO UPDATE SET
                     kind=excluded.kind, session_key=excluded.session_key, cwd=excluded.cwd, distro=excluded.distro,
-                    herdr_pane_id=excluded.herdr_pane_id, thread_id=COALESCE(excluded.thread_id, agents.thread_id),
+                    herdr_pane_id=excluded.herdr_pane_id, thread_id=excluded.thread_id,
                     automatic=excluded.automatic, channel=excluded.channel, last_seen=excluded.last_seen;
                 """;
             cmd.Parameters.AddWithValue("$address", a.Address);
@@ -134,6 +134,146 @@ internal sealed class Store : IDisposable
             cmd.Parameters.AddWithValue("$a", address);
             using var r = cmd.ExecuteReader();
             return r.Read() ? ReadAgent(r) : null;
+        }
+    }
+
+    /// <summary>The row a session last registered as on <paramref name="node"/>, if any (ADR-0008).</summary>
+    public AgentRow? FindBySession(string node, string sessionKey)
+    {
+        lock (_lock)
+        {
+            using var cmd = NewCommand();
+            cmd.CommandText = "SELECT * FROM agents WHERE node=$n AND session_key=$k AND kind<>'human' ORDER BY last_seen DESC LIMIT 1";
+            cmd.Parameters.AddWithValue("$n", node);
+            cmd.Parameters.AddWithValue("$k", sessionKey);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? ReadAgent(r) : null;
+        }
+    }
+
+    /// <summary>Earlier occupants of a herdr pane working in the same folder, most recent first (ADR-0013).</summary>
+    public List<AgentRow> PaneOccupants(string node, string kind, string pane, string? cwd)
+    {
+        lock (_lock)
+        {
+            using var cmd = NewCommand();
+            cmd.CommandText = """
+                SELECT * FROM agents WHERE node=$n AND kind=$k AND herdr_pane_id=$p AND cwd IS $c
+                ORDER BY last_seen DESC
+                """;
+            cmd.Parameters.AddWithValue("$n", node);
+            cmd.Parameters.AddWithValue("$k", kind);
+            cmd.Parameters.AddWithValue("$p", pane);
+            cmd.Parameters.AddWithValue("$c", (object?)cwd ?? DBNull.Value);
+            using var r = cmd.ExecuteReader();
+            var list = new List<AgentRow>();
+            while (r.Read()) list.Add(ReadAgent(r));
+            return list;
+        }
+    }
+
+    /// <summary>Rows that carry a Codex thread id.</summary>
+    public List<AgentRow> AgentsByThread(string threadId)
+    {
+        lock (_lock)
+        {
+            using var cmd = NewCommand();
+            cmd.CommandText = "SELECT * FROM agents WHERE thread_id=$t ORDER BY last_seen DESC";
+            cmd.Parameters.AddWithValue("$t", threadId);
+            using var r = cmd.ExecuteReader();
+            var list = new List<AgentRow>();
+            while (r.Read()) list.Add(ReadAgent(r));
+            return list;
+        }
+    }
+
+    /// <summary>The row no longer belongs to any session: a later registration must not get it back.</summary>
+    public void ReleaseSession(string address)
+    {
+        lock (_lock)
+        {
+            using var cmd = NewCommand();
+            cmd.CommandText = "UPDATE agents SET session_key=NULL, thread_id=NULL WHERE address=$a";
+            cmd.Parameters.AddWithValue("$a", address);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public void ClearThread(string address)
+    {
+        lock (_lock)
+        {
+            using var cmd = NewCommand();
+            cmd.CommandText = "UPDATE agents SET thread_id=NULL WHERE address=$a";
+            cmd.Parameters.AddWithValue("$a", address);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public void DeleteAgent(string address)
+    {
+        lock (_lock)
+        {
+            using var cmd = NewCommand();
+            cmd.CommandText = "DELETE FROM agents WHERE address=$a";
+            cmd.Parameters.AddWithValue("$a", address);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>True if any stored message was sent by or addressed to <paramref name="address"/>.</summary>
+    public bool HasMail(string address)
+    {
+        lock (_lock)
+        {
+            using var cmd = NewCommand();
+            cmd.CommandText = """
+                SELECT EXISTS(SELECT 1 FROM recipients WHERE recipient=$a) OR EXISTS(SELECT 1 FROM messages WHERE from_addr=$a)
+                """;
+            cmd.Parameters.AddWithValue("$a", address);
+            return Convert.ToInt32(cmd.ExecuteScalar(), CultureInfo.InvariantCulture) != 0;
+        }
+    }
+
+    /// <summary>Hands the mailbox and sent messages of <paramref name="from"/> over to <paramref name="to"/> (ADR-0008 §5).</summary>
+    public void MoveMail(string from, string to)
+    {
+        lock (_lock)
+        {
+            using var tx = _db.BeginTransaction();
+            foreach (var sql in new[]
+            {
+                "UPDATE OR IGNORE recipients SET recipient=$to WHERE recipient=$from",
+                "DELETE FROM recipients WHERE recipient=$from", // both were recipients of the same message
+                "UPDATE messages SET from_addr=$to WHERE from_addr=$from",
+            })
+            {
+                using var cmd = NewCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = sql;
+                cmd.Parameters.AddWithValue("$from", from);
+                cmd.Parameters.AddWithValue("$to", to);
+                cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+    }
+
+    /// <summary>Automatic-name rows not seen for <paramref name="age"/> and without unread mail (ADR-0008 §7).</summary>
+    public List<string> StaleAutomaticAgents(TimeSpan age)
+    {
+        lock (_lock)
+        {
+            using var cmd = NewCommand();
+            cmd.CommandText = """
+                SELECT address FROM agents WHERE automatic=1 AND kind<>'human' AND last_seen <= $cut AND NOT EXISTS
+                    (SELECT 1 FROM recipients r WHERE r.recipient = agents.address AND r.state IN ('queued','notified'))
+                """;
+            cmd.Parameters.AddWithValue("$cut", (DateTimeOffset.UtcNow - age).ToString("O", CultureInfo.InvariantCulture));
+            using var r = cmd.ExecuteReader();
+            var list = new List<string>();
+            while (r.Read()) list.Add(r.GetString(0));
+            return list;
         }
     }
 
@@ -272,20 +412,23 @@ internal sealed class Store : IDisposable
         }
     }
 
-    /// <summary>Messages still in <c>queued</c> for a recipient (to be announced by a wake-up).</summary>
-    public List<(string Id, string From)> QueuedFor(string recipient)
+    /// <summary>
+    /// Unread messages of a recipient, oldest first: <c>queued</c> ones are still to be announced
+    /// by a wake-up, <c>notified</c> ones were announced at <c>UpdatedAt</c> (ADR-0009).
+    /// </summary>
+    public List<(string Id, string From, string State, DateTimeOffset UpdatedAt)> UnreadFor(string recipient)
     {
         lock (_lock)
         {
             using var cmd = NewCommand();
             cmd.CommandText = """
-                SELECT m.id, m.from_addr FROM recipients r JOIN messages m ON m.id = r.message_id
-                WHERE r.recipient=$r AND r.state='queued' ORDER BY m.created_at, m.id
+                SELECT m.id, m.from_addr, r.state, r.updated_at FROM recipients r JOIN messages m ON m.id = r.message_id
+                WHERE r.recipient=$r AND r.state IN ('queued','notified') ORDER BY m.created_at, m.id
                 """;
             cmd.Parameters.AddWithValue("$r", recipient);
             using var r = cmd.ExecuteReader();
-            var list = new List<(string, string)>();
-            while (r.Read()) list.Add((r.GetString(0), r.GetString(1)));
+            var list = new List<(string, string, string, DateTimeOffset)>();
+            while (r.Read()) list.Add((r.GetString(0), r.GetString(1), r.GetString(2), ParseTime(r.GetString(3))));
             return list;
         }
     }

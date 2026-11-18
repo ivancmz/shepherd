@@ -1,6 +1,6 @@
 # ADR-0006: Modelo de mensaje
 
-- Estado: **Aceptada**
+- Estado: **Aceptada**. El apartado "Conservación" está sustituido por [ADR-0011](0011-conservacion-de-la-auditoria.md); "El usuario como participante" está matizado por [ADR-0010](0010-la-cli-no-firma-desde-un-agente.md)
 - Fecha: 2026-11-13
 - Relacionadas: [ADR-0002](0002-entrega-y-despertar.md), [ADR-0003](0003-identidad-y-nombres.md), [ADR-0004](0004-broker-local.md), [ADR-0005](0005-protocolo-de-nodo.md)
 

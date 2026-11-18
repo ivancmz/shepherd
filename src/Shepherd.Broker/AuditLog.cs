@@ -21,12 +21,45 @@ internal sealed class AuditLog
         {
             try
             {
-                File.AppendAllText(path, data.ToJsonString() + "\n", Encoding.UTF8);
+                File.AppendAllText(path, data.ToJsonString() + "\n", NoBom);
             }
             catch (IOException)
             {
                 // Auditing must never break message delivery.
             }
         }
+    }
+
+    // Encoding.UTF8 writes a BOM at the start of a new file, which breaks JSONL readers.
+    private static readonly UTF8Encoding NoBom = new(false);
+
+    /// <summary>
+    /// Deletes each monthly file once its whole month is older than <paramref name="retention"/>
+    /// (ADR-0011). Returns how many were deleted.
+    /// </summary>
+    public int Purge(TimeSpan retention)
+    {
+        var cut = DateTime.UtcNow - retention;
+        var deleted = 0;
+        lock (_lock)
+        {
+            foreach (var file in Directory.GetFiles(_dir, "audit-*.jsonl"))
+            {
+                var month = Path.GetFileNameWithoutExtension(file)["audit-".Length..];
+                if (!DateTime.TryParseExact(month, "yyyy-MM", CultureInfo.InvariantCulture,
+                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var start)) continue;
+                if (start.AddMonths(1) > cut) continue;
+                try
+                {
+                    File.Delete(file);
+                    deleted++;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Try again at the next maintenance run.
+                }
+            }
+        }
+        return deleted;
     }
 }

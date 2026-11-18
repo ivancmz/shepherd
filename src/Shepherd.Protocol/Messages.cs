@@ -15,6 +15,7 @@ public static class Methods
     public const string Status = "status";
     public const string Ack = "ack";
     public const string Shutdown = "shutdown";
+    public const string Wait = "wait";
 
     // Broker → client notifications.
     public const string MessageNew = "message.new";
@@ -72,6 +73,21 @@ public sealed record RegisterResult(string Name, string Address, bool Automatic,
 
 /// <summary>Late identity details, e.g. the Codex thread id seen in the first tools/call.</summary>
 public sealed record IdentifyParams(string? ThreadId);
+
+/// <summary>
+/// The agent's name after <c>identify</c>: a Codex session that resumes a known thread gets back
+/// the name that thread had (ADR-0008). Empty from brokers that predate it.
+/// </summary>
+public sealed record IdentifyResult(string? Name = null, string? Address = null, bool Automatic = false);
+
+/// <summary>
+/// Blocks until the broker has mail to announce to the agent of this session (ADR-0012).
+/// Sent by <c>shepherd wait</c>, which Claude Code runs as a background Stop hook.
+/// </summary>
+public sealed record WaitParams(string SessionKey);
+
+/// <summary><see cref="Notice"/> is the fixed text to show the agent; null means "nothing to announce" (see <see cref="Reason"/>).</summary>
+public sealed record WaitResult(string? Notice = null, string? Reason = null);
 
 public sealed record FileRef(string Path, string? Node = null, string? Lines = null);
 
@@ -151,6 +167,9 @@ public sealed record StatusResult
 [JsonSerializable(typeof(RegisterParams))]
 [JsonSerializable(typeof(RegisterResult))]
 [JsonSerializable(typeof(IdentifyParams))]
+[JsonSerializable(typeof(IdentifyResult))]
+[JsonSerializable(typeof(WaitParams))]
+[JsonSerializable(typeof(WaitResult))]
 [JsonSerializable(typeof(SendParams))]
 [JsonSerializable(typeof(ReplyParams))]
 [JsonSerializable(typeof(SendResult))]

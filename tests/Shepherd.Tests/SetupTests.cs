@@ -97,6 +97,76 @@ public sealed class SetupTests : IDisposable
         Assert.Single(toml.Split("[mcp_servers.shepherd]")[1..]);
     }
 
+    // ------------------------------------------------------------ Stop hook (ADR-0012)
+
+    private string Settings => Path.Combine(Home, ".claude", "settings.json");
+
+    private const string ExistingSettings = """
+        {
+          "model": "opus",
+          "hooks": {
+            "PreToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": "python guard.py" } ] } ],
+            "Stop": [ { "hooks": [ { "type": "command", "command": "python please wait" } ] } ]
+          }
+        }
+        """;
+
+    private List<System.Text.Json.Nodes.JsonObject> StopHooks() =>
+        System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Settings))!["hooks"]?["Stop"]?.AsArray()
+            .SelectMany(g => g!["hooks"]!.AsArray()).Select(h => h!.AsObject()).ToList() ?? [];
+
+    [Fact]
+    public async Task Apply_adds_the_stop_hook_and_keeps_the_other_settings()
+    {
+        File.WriteAllText(Settings, ExistingSettings);
+        var setup = NewSetup();
+        await setup.ApplyAsync();
+        await NewSetup(new DateTime(2026, 11, 14, 11, 0, 0)).ApplyAsync(); // idempotent
+
+        var root = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Settings))!;
+        Assert.Equal("opus", root["model"]!.GetValue<string>());
+        Assert.Equal("python guard.py", root["hooks"]!["PreToolUse"]![0]!["hooks"]![0]!["command"]!.GetValue<string>());
+
+        var hooks = StopHooks();
+        Assert.Equal(2, hooks.Count);
+        Assert.Equal("python please wait", hooks[0]["command"]!.GetValue<string>()); // someone else's, untouched
+        var ours = hooks[1];
+        var exe = Path.Combine(setup.InstallDir(), "shepherd.exe").Replace('\\', '/');
+        Assert.Equal($"\"{exe}\" wait", ours["command"]!.GetValue<string>());
+        Assert.True(ours["asyncRewake"]!.GetValue<bool>());
+        Assert.Equal(86400, ours["timeout"]!.GetValue<int>());
+        Assert.NotEmpty(Directory.GetFiles(Path.Combine(Home, ".claude"), "settings.json.bak-shepherd-*"));
+    }
+
+    [Fact]
+    public async Task A_new_build_replaces_its_own_stop_hook()
+    {
+        await NewSetup().ApplyAsync();
+        File.WriteAllText(Path.Combine(Source, "shepherd.exe"), "fake exe v2");
+        var second = NewSetup(new DateTime(2026, 11, 14, 11, 0, 0));
+        await second.ApplyAsync();
+        var hook = Assert.Single(StopHooks());
+        Assert.Contains(Path.GetFileName(second.InstallDir()), hook["command"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Undo_removes_only_the_shepherd_stop_hook()
+    {
+        File.WriteAllText(Settings, ExistingSettings);
+        await NewSetup().ApplyAsync();
+        await NewSetup(new DateTime(2026, 11, 14, 12, 0, 0)).UndoAsync();
+        Assert.Equal("python please wait", Assert.Single(StopHooks())["command"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Settings_that_cannot_be_parsed_are_left_alone()
+    {
+        const string broken = "{ \"hooks\": [ oops";
+        File.WriteAllText(Settings, broken);
+        await NewSetup().ApplyAsync();
+        Assert.Equal(broken, File.ReadAllText(Settings));
+    }
+
     [Fact]
     public async Task A_new_build_installs_side_by_side()
     {

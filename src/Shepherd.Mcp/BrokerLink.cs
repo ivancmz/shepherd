@@ -8,8 +8,8 @@ namespace Shepherd.Mcp;
 /// <summary>
 /// The shim's long-lived link to the broker (diagram 3): locate/spawn → hello → register →
 /// ready, with exponential back-off reconnection. A reconnecting session keeps its name:
-/// an explicit name is requested again, and an automatic one is re-derived from the same
-/// session key, which the broker lets through (ADR-0003, ADR-0005).
+/// an explicit name is requested again, and without one the broker gives back the name the
+/// session key last had (ADR-0008, ADR-0005).
 /// </summary>
 internal sealed class BrokerLink : IAsyncDisposable
 {
@@ -73,8 +73,20 @@ internal sealed class BrokerLink : IAsyncDisposable
         if (threadId == _threadId) return;
         _threadId = threadId;
         var client = await GetAsync(ct).ConfigureAwait(false);
-        await client.IdentifyAsync(new IdentifyParams(threadId), ct).ConfigureAwait(false);
+        Adopt(await client.IdentifyAsync(new IdentifyParams(threadId), ct).ConfigureAwait(false));
     }
+
+    /// <summary>A Codex session that resumes a known thread gets its previous name back (ADR-0008).</summary>
+    private void Adopt(IdentifyResult r)
+    {
+        if (r.Name is null || r.Address is null || r.Address == Registration?.Address) return;
+        _log($"thread known to the broker: now registered as {r.Address}");
+        Registration = new RegisterResult(r.Name, r.Address, r.Automatic);
+    }
+
+    /// <summary>One-shot "unread mail waiting" note from registration, for sessions nothing can wake (ADR-0009).</summary>
+    public string? TakeMailNotice() => Interlocked.Exchange(ref _mailNotice, null);
+    private string? _mailNotice;
 
     private async Task ConnectLoopAsync()
     {
@@ -92,7 +104,7 @@ internal sealed class BrokerLink : IAsyncDisposable
                 client.Peer.StartKeepAlive(Endpoints.KeepAliveInterval, Endpoints.KeepAliveTimeout);
 
                 await RegisterAsync(client).ConfigureAwait(false);
-                if (_threadId is { } tid) await client.IdentifyAsync(new IdentifyParams(tid), _cts.Token).ConfigureAwait(false);
+                if (_threadId is { } tid) Adopt(await client.IdentifyAsync(new IdentifyParams(tid), _cts.Token).ConfigureAwait(false));
 
                 _client = client;
                 Volatile.Read(ref _ready).TrySetResult(client);
@@ -136,6 +148,8 @@ internal sealed class BrokerLink : IAsyncDisposable
             _notice = $"The name '{wanted}' is not available ({ex.Message}); you are registered as '{Registration.Name}'. Use the register tool to choose another name.";
             _log(_notice);
         }
+        // With a channel the broker pushes the pending mail itself.
+        if (Registration.Notice is { } mail && !_identity!.Channel) _mailNotice = mail;
         _log($"registered as {Registration.Address}");
     }
 

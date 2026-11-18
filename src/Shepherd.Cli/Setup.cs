@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Shepherd.Broker;
 
 namespace Shepherd.Cli;
@@ -64,6 +66,7 @@ internal sealed class Setup(SetupContext ctx)
     private string AgentsMd => Path.Combine(ctx.Home, ".codex", "AGENTS.md");
     private string CodexToml => Path.Combine(ctx.Home, ".codex", "config.toml");
     private string ClaudeJson => Path.Combine(ctx.Home, ".claude.json");
+    private string ClaudeSettings => Path.Combine(ctx.Home, ".claude", "settings.json");
     private string ExeName => ctx.Windows ? "shepherd.exe" : "shepherd";
     private string[] NativeLibs => ctx.Windows ? ["e_sqlite3.dll"] : ["libe_sqlite3.so"];
 
@@ -75,6 +78,8 @@ internal sealed class Setup(SetupContext ctx)
         plan.Add(ctx.ClaudePath is null
             ? "Claude Code: not found, skipped"
             : $"Claude Code: claude mcp add -s user shepherd -- \"{Path.Combine(target, ExeName)}\" mcp  (backup of {ClaudeJson})");
+        if (ctx.ClaudePath is not null)
+            plan.Add($"Claude Code: Stop hook `{WaitCommand(Path.Combine(target, ExeName))}` (asyncRewake) in {ClaudeSettings}, so idle sessions are woken when mail arrives  (backup first)");
         plan.Add(ctx.CodexPath is null
             ? "Codex: not found, skipped"
             : $"Codex: codex mcp add shepherd -- \"{Path.Combine(target, ExeName)}\" mcp, then default_tools_approval_mode = \"approve\" for shepherd only  (backup of {CodexToml})");
@@ -101,6 +106,7 @@ internal sealed class Setup(SetupContext ctx)
             await RunAsync(ctx.ClaudePath, ["mcp", "add", "-s", "user", "shepherd", "--", exe, "mcp"], ignoreFailure: false, ct);
             ctx.Out("Claude Code: shepherd registered (user scope)");
             AddBlock(ClaudeMd);
+            AddWaitHook(exe);
         }
 
         if (ctx.CodexPath is not null)
@@ -123,6 +129,7 @@ internal sealed class Setup(SetupContext ctx)
             Backup(ClaudeJson);
             await RunAsync(ctx.ClaudePath, ["mcp", "remove", "-s", "user", "shepherd"], ignoreFailure: true, ct);
             RemoveBlock(ClaudeMd);
+            RemoveWaitHook();
         }
         if (ctx.CodexPath is not null)
         {
@@ -276,6 +283,105 @@ internal sealed class Setup(SetupContext ctx)
         var nl = text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
         if (head.Length == 0) return tail;
         return tail.Length == 0 ? head + nl : head + nl + nl + tail;
+    }
+
+    // ------------------------------------------------------------ Stop hook (ADR-0012)
+
+    /// <summary>
+    /// Hook timeout: Claude Code enforces it on asyncRewake hooks (default 600 s). One day was
+    /// checked to be accepted and honoured past the default (spike of 2026-11-16).
+    /// </summary>
+    private const int WaitHookTimeoutSeconds = 24 * 3600;
+
+    private static bool IsWaitHookCommand(string command)
+    {
+        var c = command.TrimEnd();
+        return c.EndsWith(" wait", StringComparison.OrdinalIgnoreCase)
+               && Path.GetFileNameWithoutExtension(c[..^" wait".Length].Trim().Trim('"')).Equals("shepherd", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Forward slashes: the hook runs through a shell, and Git Bash would eat backslashes.</summary>
+    internal static string WaitCommand(string exe) => $"\"{exe.Replace('\\', '/')}\" wait";
+
+    /// <summary>
+    /// Adds (or refreshes) the Stop hook that runs <c>shepherd wait</c> in the background. Other
+    /// settings and hooks are kept. A file that cannot be parsed is left alone.
+    /// </summary>
+    private void AddWaitHook(string exe)
+    {
+        if (LoadSettings() is not { } root) return;
+        RemoveWaitHooks(root);
+        var hooks = root["hooks"] as JsonObject ?? (JsonObject)(root["hooks"] = new JsonObject())!;
+        var stop = hooks["Stop"] as JsonArray ?? (JsonArray)(hooks["Stop"] = new JsonArray())!;
+        stop.Add((JsonNode)new JsonObject
+        {
+            ["hooks"] = new JsonArray(new JsonObject
+            {
+                ["type"] = "command",
+                ["command"] = WaitCommand(exe),
+                ["asyncRewake"] = true,
+                ["timeout"] = WaitHookTimeoutSeconds,
+            }),
+        });
+        SaveSettings(root);
+        ctx.Out("Claude Code: Stop hook added (idle sessions are woken when mail arrives)");
+    }
+
+    private void RemoveWaitHook()
+    {
+        if (!File.Exists(ClaudeSettings) || LoadSettings() is not { } root) return;
+        if (RemoveWaitHooks(root)) SaveSettings(root);
+    }
+
+    private JsonObject? LoadSettings()
+    {
+        if (!File.Exists(ClaudeSettings)) return new JsonObject();
+        try
+        {
+            var text = File.ReadAllText(ClaudeSettings);
+            if (string.IsNullOrWhiteSpace(text)) return new JsonObject();
+            if (JsonNode.Parse(text) is JsonObject o && o["hooks"] is null or JsonObject && (o["hooks"]?["Stop"]) is null or JsonArray) return o;
+        }
+        catch (JsonException)
+        {
+        }
+        ctx.Out($"Claude Code: {ClaudeSettings} is not plain JSON in the expected shape; the Stop hook was not touched");
+        return null;
+    }
+
+    private void SaveSettings(JsonObject root)
+    {
+        Backup(ClaudeSettings);
+        Directory.CreateDirectory(Path.GetDirectoryName(ClaudeSettings)!);
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }))
+            root.WriteTo(writer);
+        File.WriteAllText(ClaudeSettings, Encoding.UTF8.GetString(stream.ToArray()) + "\n", new UTF8Encoding(false));
+    }
+
+    /// <summary>Removes every shepherd wait hook, and the containers it leaves empty. True if anything changed.</summary>
+    private static bool RemoveWaitHooks(JsonObject root)
+    {
+        if (root["hooks"] is not JsonObject hooks || hooks["Stop"] is not JsonArray stop) return false;
+        var changed = false;
+        for (var i = stop.Count - 1; i >= 0; i--)
+        {
+            if (stop[i] is not JsonObject group || group["hooks"] is not JsonArray list) continue;
+            var removed = false;
+            for (var j = list.Count - 1; j >= 0; j--)
+            {
+                if (list[j] is JsonObject h && h["command"] is JsonValue c && c.TryGetValue<string>(out var cmd) && IsWaitHookCommand(cmd))
+                {
+                    list.RemoveAt(j);
+                    removed = true;
+                }
+            }
+            if (removed && list.Count == 0) stop.RemoveAt(i);
+            changed |= removed;
+        }
+        if (changed && stop.Count == 0) hooks.Remove("Stop");
+        if (changed && hooks.Count == 0) root.Remove("hooks");
+        return changed;
     }
 
     private static void WriteKeepingNewlines(string path, List<string> lines)
